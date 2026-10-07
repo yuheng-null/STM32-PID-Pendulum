@@ -1,0 +1,37 @@
+{
+    // 本文件在「把 PID_Pendulum 本身作为 VSCode 工作区打开」时生效。
+    //
+    // ★ 必须把本工程目录本身作为 VSCode 工作区打开：ST 的全套工具（CMake 支持、
+    //   Build Analyzer、调试扩展）都假设「工作区根 == CMake 工程目录」。若拿外层
+    //   目录当工作区，它们会以各种面目失败（弹 "contains multiple CMake projects"
+    //   警告、调试报 No GDB Server running、Build Analyzer 显示 Project
+    //   configuration issue）。
+    //
+    // arm-none-eabi-gcc 的 PATH 放在用户级 settings.json 的 cmake.environment 里，
+    // 所有工程共用，这里不重复。
+    // 本项目用 CMakePresets.json（Ninja + gcc-arm-eabi.cmake 工具链文件），
+    // 让 CMake Tools 直接走 preset，不要它自己去猜 kit
+    "cmake.useCMakePresets": "always",
+    // 用 ST 版 clangd 提供 IntelliSense（用户级已全局关闭 MS C/C++ 的 IntelliSense）
+    "C_Cpp.intelliSenseEngine": "disabled",
+    // 排除构建产物，避免文件树和搜索结果被 .obj 淹没
+    "files.exclude": {
+        "**/build": true
+    },
+    "search.exclude": {
+        "**/build": true
+    },
+    "cmake.cmakePath": "cube-cmake",
+    "cmake.configureArgs": [
+        "-DCMAKE_COMMAND=cube-cmake"
+    ],
+    "cmake.preferredGenerators": [
+        "Ninja"
+    ],
+    "stm32cube-ide-clangd.path": "cube",
+    "stm32cube-ide-clangd.arguments": [
+        "starm-clangd",
+        "--query-driver=${env:CUBE_BUNDLE_PATH}/gnu-tools-for-stm32/14.3.1+st.2/bin/arm-none-eabi-gcc*",
+        "--query-driver=${env:CUBE_BUNDLE_PATH}/gnu-tools-for-stm32/14.3.1+st.2/bin/arm-none-eabi-g++*"
+    ]
+}

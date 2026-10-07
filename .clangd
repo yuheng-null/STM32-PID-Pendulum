@@ -1,0 +1,6 @@
+CompileFlags:
+  CompilationDatabase: build/Debug
+Diagnostics:
+  Suppress:
+    - drv_unknown_argument
+    - unknown_warning_option

@@ -1,0 +1,74 @@
+# ============================================================================
+#  STM32-PID-Pendulum
+# ============================================================================
+
+# ---------------------------------------------------------------- 构建产物 --
+build/
+mx.scratch/
+
+# 万一产物落到了 build/ 外面
+*.o
+*.obj
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.su
+
+# ----------------------------------------------------------- CMake / Ninja --
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+build.ninja
+*.ninja
+.ninja_deps
+.ninja_log
+CMakeUserPresets.json
+
+# ------------------------------------------------------- STM32CubeMX / ST --
+*.ioc.bak
+*.bak
+*.origin
+
+# ------------------------------------------------------------ VSCode 配置 --
+# 整个 .vscode/ 默认忽略，只放行三份对别人有用的配置：
+#   settings.json         —— CMake preset、clangd 接线方式
+#   launch.json           —— cortex-debug + ST-Link 调试配置（已脱敏）
+#   c_cpp_properties.json —— 指向 build 里的 compile_commands.json
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/c_cpp_properties.json
+!.vscode/extensions.json
+!.vscode/tasks.json
+
+# ------------------------------------------------------- 编辑器 / 操作系统 --
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+*.swp
+*.log
+
+# ------------------------------------------------------------ AI 助手配置 --
+# 不把 AI 助手的配置和记忆文件提交进仓库
+.claude/
+CLAUDE.md
+.cursor/
+.cursorrules
+.aider*
+.github/copilot-instructions.md
+
+# ============================================================================
+#  以下内容是**故意入库**的，不要往上面加忽略规则：
+#
+#    .settings/        ST 的 STM32CubeIDE for VSCode 扩展记录的工具链 bundle
+#                      版本，入库后协作者能对齐到同一套 cmake/ninja/gcc。
+#    .mxproject        STM32CubeMX 的工程簿记，重新生成代码时要用。
+#    .clangd           clangd 的工程配置（指向 build/Debug）。
+#    PID_Pendulum.ioc  CubeMX 工程定义本身，改了它才能重新生成代码。
+#    Drivers/          ST 的 HAL 库与 CMSIS，属于第三方代码（见 README 许可章节）。
+# ============================================================================

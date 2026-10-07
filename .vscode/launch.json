@@ -1,0 +1,56 @@
+{
+    // ── 为什么用 cortex-debug + servertype "stlink" ──────────────────────────
+    // ST 官方的 stlinkgdbtarget 依赖「工作区根 == CMake 工程目录」的工程识别，
+    // 工作区布局稍有不同就识别不了，且启动 GDB Server 失败时**不写任何日志**，无法排查。
+    //
+    // cortex-debug 的 "stlink" 类型是专门对接 ST 自家 ST-LINK_gdbserver 的，它会：
+    //   · 自动传 -cp <stm32cubeprogrammer>
+    //   · 自动加 --swd / --halt
+    //   · 就绪检测用 /(Waiting for debugger connection|Listening at)/，原生匹配
+    //     （不需要 overrideGDBServerStartedRegex）
+    //
+    // ⚠️ 不要用 servertype "external" —— 那是「你自己先把服务器起好」的模式，
+    //    cortex-debug 不会替你启动任何东西。
+    //
+    // ── 关于下面的 ${env:CUBE_BUNDLE_PATH} ──────────────────────────────────
+    // 这些工具都来自 STM32CubeIDE for VSCode 扩展自动下载的 bundle，装在
+    //   %LOCALAPPDATA%\stm32cube\bundles\<组件名>\<版本>\
+    // 扩展在激活时会把这个目录写进 process.env.CUBE_BUNDLE_PATH，
+    // 所以这里用 ${env:...} 引用，避免把个人用户名绝对路径写死进仓库。
+    //
+    // 如果调试时报路径找不到（比如 bundle 升级后版本号变了），
+    // 去 %LOCALAPPDATA%\stm32cube\bundles\ 下看一眼实际版本号，改下面四行即可；
+    // 也可以参考本工程 .settings/bundles-lock.store.json 里锁定的版本。
+    //
+    // 换芯片时改：device、executable 里的工程名。
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "调试 (ST-Link)",
+            "type": "cortex-debug",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+
+            "executable": "${workspaceFolder}/build/Debug/PID_Pendulum.elf",
+
+            // CMSIS 设备名（注意不是 CubeMX 里的 STM32F103C8Tx）
+            "device": "STM32F103C8",
+            "interface": "swd",
+
+            // GDB Server：cortex-debug 的 stlink 类型
+            "servertype": "stlink",
+            "stlinkPath": "${env:CUBE_BUNDLE_PATH}/stlink-gdbserver/7.14.0+st.2/bin/ST-LINK_gdbserver.exe",
+
+            // 必须给！否则它去 %ProgramFiles%\STMicroelectronics\...\STM32CubeProgrammer\bin
+            // 找，没装的话 gdbserver 会报 "Missing application STM32CubeProgrammer" 后退出。
+            // 要指向**含 STM32_Programmer_CLI.exe 的那个目录**，即 bin。
+            "stm32cubeprogrammer": "${env:CUBE_BUNDLE_PATH}/programmer/2.23.0/bin",
+
+            // 工具链显式指定，不依赖 PATH
+            "armToolchainPath": "${env:CUBE_BUNDLE_PATH}/gnu-tools-for-stm32/14.3.1+st.2/bin",
+            "gdbPath": "${env:CUBE_BUNDLE_PATH}/gnu-gdb-for-stm32/14.3.1+st.2/bin/arm-none-eabi-gdb.exe",
+
+            "runToEntryPoint": "main"
+        }
+    ]
+}
