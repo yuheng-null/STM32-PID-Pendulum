@@ -19,21 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
---------------------------------------------------------------------------
-NOTE / 说明
-
-The MIT License above applies to the project's own source code
-(Core/, CMakeLists.txt, CMakePresets.json, cmake/, linker script, etc.).
-
-It does NOT apply to the third-party components bundled in this repository,
-which keep their own upstream licenses:
-
-  Drivers/STM32F1xx_HAL_Driver/  — STMicroelectronics, BSD-3-Clause
-                                   (see Drivers/STM32F1xx_HAL_Driver/LICENSE.txt)
-  Drivers/CMSIS/                 — ARM Limited, Apache-2.0
-                                   (see Drivers/CMSIS/LICENSE.txt)
-
-上述 MIT 协议仅覆盖本项目自有的源码（Core/ 与各 CMake/链接脚本等）。
-仓库内 Drivers/ 下的 ST HAL 驱动与 CMSIS 属于第三方代码，
-分别遵循其自带的 BSD-3-Clause 与 Apache-2.0 协议，不适用 MIT。

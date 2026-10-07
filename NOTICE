@@ -1,0 +1,44 @@
+STM32-PID-Pendulum — 第三方代码归属说明
+========================================================
+
+本仓库根目录 LICENSE 中的 MIT 协议，适用于本项目**自有**的代码：
+CMake 构建脚本、链接脚本以外的工程配置、以及 Core/ 中 USER CODE 区块内
+由本项目作者编写的代码。
+
+本仓库同时包含以下第三方代码，**不适用 MIT 协议**，各自遵循上游协议。
+分发本仓库（或其衍生作品）时，请一并保留这些归属与协议声明。
+
+--------------------------------------------------------
+
+1. STM32F1xx HAL Driver
+   路径      Drivers/STM32F1xx_HAL_Driver/
+   版权方    STMicroelectronics
+   协议      BSD-3-Clause
+   协议全文  Drivers/STM32F1xx_HAL_Driver/LICENSE.txt
+             https://opensource.org/licenses/BSD-3-Clause
+
+2. CMSIS — Cortex Microcontroller Software Interface Standard
+   路径      Drivers/CMSIS/
+   版权方    ARM Limited
+   协议      Apache-2.0
+   协议全文  Drivers/CMSIS/LICENSE.txt
+             https://www.apache.org/licenses/LICENSE-2.0
+
+3. ST 生成的工程骨架文件
+   路径      startup_stm32f103xb.s
+             STM32F103XX_FLASH.ld
+             Core/Src/{main.c, stm32f1xx_it.c, stm32f1xx_hal_msp.c,
+                       system_stm32f1xx.c, syscalls.c, sysmem.c}
+             Core/Inc/{main.h, stm32f1xx_it.h, stm32f1xx_hal_conf.h}
+   版权方    STMicroelectronics
+   来源      STM32CubeMX 6.15.0 + STM32Cube FW_F1 固件包 V1.8.7
+   协议      BSD-3-Clause
+   说明      这些文件由 STM32CubeMX 依据 .ioc 生成，文件头部的版权声明归
+             STMicroelectronics（startup_stm32f103xb.s 为 "Copyright (c)
+             2017-2021 STMicroelectronics"）。其中 USER CODE BEGIN / END
+             注释区块内由本项目作者编写的内容，适用本仓库的 MIT 协议。
+
+--------------------------------------------------------
+
+注：本仓库不含任何江协科技教程的代码。教程使用标准库（SPL）实现，
+本项目为学习过程中用 HAL 库独立编写的实现。

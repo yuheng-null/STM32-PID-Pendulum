@@ -131,11 +131,14 @@ STM32_Programmer_CLI -c port=SWD -w build/Debug/PID_Pendulum.elf -rst
 
 本工程自有代码以 [MIT 协议](LICENSE) 开源，Copyright (c) 2026 yuheng-null。
 
-仓库内 `Drivers/` 下为 ST 与 ARM 的第三方代码，**不适用 MIT**，各自遵循上游协议：
+仓库内含第三方代码，**不适用 MIT**，各自遵循上游协议：
 
 | 路径 | 版权方 | 协议 |
 | --- | --- | --- |
 | `Drivers/STM32F1xx_HAL_Driver/` | STMicroelectronics | BSD-3-Clause |
 | `Drivers/CMSIS/` | ARM Limited | Apache-2.0 |
+| `startup_stm32f103xb.s`、`STM32F103XX_FLASH.ld`、`Core/` 中由 CubeMX 生成的文件 | STMicroelectronics | BSD-3-Clause |
 
-具体条款见各目录下的 `LICENSE.txt`。
+具体条款见各目录下的 `LICENSE.txt`，完整归属说明见 [NOTICE](NOTICE)。
+
+> 注：本仓库不含任何江协科技教程的代码。教程使用标准库（SPL）实现，本项目为学习过程中用 HAL 库独立编写的实现。
