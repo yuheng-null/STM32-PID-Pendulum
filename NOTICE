@@ -38,7 +38,22 @@ CMake 构建脚本、链接脚本以外的工程配置、以及 Core/ 中 USER C
              2017-2021 STMicroelectronics"）。其中 USER CODE BEGIN / END
              注释区块内由本项目作者编写的内容，适用本仓库的 MIT 协议。
 
+4. afiskon/stm32-ssd1306 —— SSD1306 字库
+   路径      driver/device/ssd1306/ssd1306_fonts.c
+             driver/device/ssd1306/ssd1306_fonts.h
+   版权方    Copyright (c) 2018 Aleksander Alekseev
+             （原始版本由 Olivier Van den Eede (4ilo) 于 2016 年编写）
+   来源      https://github.com/afiskon/stm32-ssd1306
+   协议      MIT
+   说明      这两个文件按原样引入，未作修改。其中的字模数据即通常所说的
+             "字库"，属于可复用的现成资产，本项目的器件驱动代码
+             （ssd1306.c / ssd1306.h / ssd1306_reg.h / ssd1306_conf.h）
+             为独立编写，依赖该字库提供的数据结构布局。
+
 --------------------------------------------------------
 
-注：本仓库不含任何江协科技教程的代码。教程使用标准库（SPL）实现，
-本项目为学习过程中用 HAL 库独立编写的实现。
+注 1：本仓库不含任何江协科技教程的代码。教程使用标准库（SPL）实现，
+      本项目为学习过程中用 HAL 库独立编写的实现。
+
+注 2：ssd1306_fonts.c 中由 Google 提供的 Roboto Thin 字体（Font_16x15）
+      单独遵循 Apache-2.0 协议，见该文件内注释。本工程当前未启用该字体。

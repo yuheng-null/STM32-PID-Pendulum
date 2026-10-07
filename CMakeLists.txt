@@ -43,13 +43,25 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 )
 
 # Add sources to executable
+#
+# 分层结构（详细说明见 README）：
+#   driver/common     公共类型（error_t）
+#   driver/bus        总线驱动，直接贴着 HAL
+#   driver/device     器件驱动，只依赖抽象总线接口
+#   bsp               板级支持，把上面几层按本板接线组装起来
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user sources here
+    ${CMAKE_CURRENT_SOURCE_DIR}/driver/bus/i2c/i2c_soft.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/driver/device/ssd1306/ssd1306.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/driver/device/ssd1306/ssd1306_fonts.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/oled/bsp_oled.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user defined include paths
+    ${CMAKE_CURRENT_SOURCE_DIR}/driver/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/driver/bus/i2c
+    ${CMAKE_CURRENT_SOURCE_DIR}/driver/device/ssd1306
+    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/oled
 )
 
 # Add project symbols (macros)
