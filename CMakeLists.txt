@@ -56,6 +56,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/oled/bsp_oled.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/tick/bsp_tick.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/key/bsp_key.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/pot/bsp_pot.c
 )
 
 # Add include paths
@@ -66,6 +67,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/oled
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/tick
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/key
+    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/pot
 )
 
 # Add project symbols (macros)

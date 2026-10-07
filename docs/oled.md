@@ -106,7 +106,14 @@ PB8 / PB9 两根线 ──I2C 电平信号──► SSD1306 ──► 像素亮/
 
 总线速度约 300 kHz，刷新一屏（1024 字节）约 30 ms，对显示用途完全够用。
 
-软件 I2C 直接接管 PB8/PB9 的 GPIO 配置（开漏 + 上拉），**没有**在 CubeMX 里把这两个引脚配成 `GPIO_Output` —— 位翻转总线的引脚时序属于总线实现的一部分，由总线驱动自己配置更内聚，也避免 CubeMX 重新生成代码时把模式改回推挽。
+关于 PB8/PB9 由谁配置，这里和「按键」的做法不同，值得说清楚：
+
+| | 谁配 | 为什么 |
+| --- | --- | --- |
+| `.ioc` → `MX_GPIO_Init()` | CubeMX | PB8/PB9 在 `.ioc` 里**是有声明的**（`Signal=GPIO_Output`，开漏 + 上拉 + 高速）。声明的作用是**占位**：CubeMX 因此在配置阶段就知道这两个脚已被占用，以后加外设时不会静默抢走它们 |
+| `i2c_soft_gpio_config()` | 总线驱动 | 「开漏 + 上拉」是 **I2C 协议的一部分**，总线驱动必须自包含——它要能脱离 CubeMX 换到别的引脚复用，也要能在 PC 上用假总线做单元测试 |
+
+所以这两处**都在配**，电气参数完全相同。代价是改一处就要改另一处，这是本工程唯一一处有意保留的双份配置。
 
 ---
 
@@ -987,20 +994,19 @@ const SSD1306_Font_t Font_6x8 = {6, 8, Font6x8, NULL};
 [bsp_oled.c](../bsp/oled/bsp_oled.c) 很短，但它决定了"这块板子上，屏接在哪"。
 
 ```c
-#define BSP_OLED_SCL_PORT   (GPIOB)
-#define BSP_OLED_SCL_PIN    (GPIO_PIN_8)      /* SCL 接 PB8 */
-#define BSP_OLED_SDA_PORT   (GPIOB)
-#define BSP_OLED_SDA_PIN    (GPIO_PIN_9)      /* SDA 接 PB9 */
-
 error_t bsp_oled_init(ssd1306_t *dev)
 {
-    __HAL_RCC_GPIOB_CLK_ENABLE();     /* ← 注意这一步！ */
+    if (dev == NULL) {
+        return ERR_INVALID_PARAM;
+    }
+
+    /* GPIOB 的时钟由 CubeMX 生成的 MX_GPIO_Init() 使能（PB8/PB9 已在 .ioc 里） */
 
     const i2c_soft_cfg_t bus_cfg = {
-        .scl_port = BSP_OLED_SCL_PORT,
-        .scl_pin  = BSP_OLED_SCL_PIN,
-        .sda_port = BSP_OLED_SDA_PORT,
-        .sda_pin  = BSP_OLED_SDA_PIN,
+        .scl_port = OLED_SCL_GPIO_Port,   /* 引脚宏来自 CubeMX，见 main.h */
+        .scl_pin  = OLED_SCL_Pin,
+        .sda_port = OLED_SDA_GPIO_Port,
+        .sda_pin  = OLED_SDA_Pin,
         .freq_hz  = I2C_SOFT_DEFAULT_FREQ_HZ,
     };
 
@@ -1013,13 +1019,31 @@ error_t bsp_oled_init(ssd1306_t *dev)
     dev->addr     = BSP_OLED_I2C_ADDR;             /* 注入地址 */
     dev->delay_ms = bsp_oled_delay_ms;             /* 注入延时 */
 
+    if (dev->bus == NULL) {
+        return ERR_NOT_INITIALIZED;
+    }
+
+    s_oled_ready = true;                           /* 挂牌营业前先干完活 */
+
     return ssd1306_init(dev);
 }
 ```
 
-**`__HAL_RCC_GPIOB_CLK_ENABLE()` 这行非常关键，也最容易漏。** STM32 的每个外设（包括每个 GPIO 端口）都有独立的时钟开关，**不开时钟，写它的寄存器完全无效，而且是静默的**——不报错、不报警，就是没反应。
+注意这里**没有** `__HAL_RCC_GPIOB_CLK_ENABLE()`。STM32 的每个外设（包括每个 GPIO 端口）都有独立的时钟开关，**不开时钟，写它的寄存器完全无效，而且是静默的**——不报错、不报警，就是没反应，这是新手做第二、第三个外设时最常踩的坑。
 
-本工程只用了 PC13（LED）和 PA13/PA14（SWD），所以 CubeMX 生成的 `MX_GPIO_Init()` 里只有 GPIOA/C/D，**没有 GPIOB**。因此 BSP 必须自己开。这是新手做第二、第三个外设时最常踩的坑——代码逻辑全对，就是没反应。
+本工程的 GPIOB 时钟由 CubeMX 生成的 `MX_GPIO_Init()` 使能——因为 PB8/PB9（OLED）和 PB10/PB11（按键）都在 `.ioc` 里声明了，CubeMX 自然会把 GPIOB 的时钟打开：
+
+```c
+/* MX_GPIO_Init()，CubeMX 生成 */
+__HAL_RCC_GPIOC_CLK_ENABLE();
+__HAL_RCC_GPIOD_CLK_ENABLE();
+__HAL_RCC_GPIOB_CLK_ENABLE();       /* ← 由 .ioc 里的引脚声明推导出来 */
+__HAL_RCC_GPIOA_CLK_ENABLE();
+```
+
+**这就是「能用 CubeMX 生成的就不手写」的实际收益**：只要引脚在 `.ioc` 里声明过，时钟、端口配置都会跟着自动生成，不需要人工记得开。
+
+> 反过来说：如果哪天某个模块用了一个**没有**写进 `.ioc` 的引脚（本工程的软件 I2C 就是这么设计的——它要能脱离 CubeMX 复用），那它的时钟就必须自己开。判断标准是「这个引脚在不在 `.ioc` 里」，不是「哪个模块在用」。
 
 **关于 `dev->bus / addr / delay_ms` 这三个"注入"**：设备驱动不认识具体总线、不认识具体地址、不认识延时怎么实现，全由上层填好再调 `init`。好处是同一份 `ssd1306.c` 可以用在软件 I2C、硬件 I2C、SPI 转 I2C 上，也可以在 PC 上用假总线跑。
 
@@ -1232,7 +1256,7 @@ arm-none-eabi-nm --print-size build/Debug/PID_Pendulum.elf | grep loop_count
 
 | 坑 | 现象 | 原因 |
 |---|---|---|
-| 忘记开 GPIO 时钟 | 代码全对，引脚毫无反应，且无任何报错 | `__HAL_RCC_GPIOB_CLK_ENABLE()` 必须显式调用 |
+| 引脚没写进 `.ioc` 又忘了开时钟 | 代码全对，引脚毫无反应，且无任何报错 | 声明进 `.ioc` 的引脚，时钟由 CubeMX 生成；脱离 CubeMX 使用的引脚要自己 `__HAL_RCC_GPIOx_CLK_ENABLE()` |
 | 忘记开电荷泵 | 通信完全正常，但屏永远不亮 | `CHARGE_PUMP` 命令是这类模块的必需品，无外部 VCC |
 | 控制字节和数据分两次发 | 屏上花屏或完全不动 | SSD1306 的控制字节必须和数据在同一 I2C 帧内 |
 | 画点用 `=` 而不是 `\|=` | 一列像素被整列抹掉 | 要读-改-写，只动目标位 |

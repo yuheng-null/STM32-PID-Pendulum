@@ -1,20 +1,20 @@
 /* USER CODE BEGIN Header */
 /**
- ******************************************************************************
- * @file           : main.c
- * @brief          : Main program body
- ******************************************************************************
- * @attention
- *
- * Copyright (c) 2026 STMicroelectronics.
- * All rights reserved.
- *
- * This software is licensed under terms that can be found in the LICENSE file
- * in the root directory of this software component.
- * If no LICENSE file comes with this software, it is provided AS-IS.
- *
- ******************************************************************************
- */
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
@@ -27,6 +27,7 @@
 
 #include "bsp_tick.h"
 #include "bsp_key.h"
+#include "bsp_pot.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -38,23 +39,39 @@
 /* USER CODE BEGIN PD */
 /* 屏幕上各元素的位置（单位：像素）。集中在这里，改版式不用翻代码。 */
 #define OLED_LINE_TITLE_Y       (0U)    /* 标题，Font_7x10，占 0~9      */
-#define OLED_LINE_STATE_Y       (12U)   /* 4 个键的实时状态，占 12~19   */
-#define OLED_LINE_RULE_Y        (22U)   /* 分隔线                       */
-#define OLED_LINE_CNT_12_Y      (25U)   /* K1/K2 计数，占 25~32         */
-#define OLED_LINE_CNT_34_Y      (35U)   /* K3/K4 计数，占 35~42         */
-#define OLED_LINE_EDGE_Y        (45U)   /* 最近按下/松开，占 45~52      */
-#define OLED_LINE_INFO_Y        (55U)   /* 消抖参数说明，占 55~62       */
 
-/* 状态块 "K1[ ]" 共 5 字符 = 30 像素，4 块间隔 32 像素，共占 0~125 */
-#define OLED_KEY_STATE_X0       (0U)
-#define OLED_KEY_STATE_STEP     (32U)
+/*
+ * 4 路电位器各占一行，行距 12 像素：文字高 8、进度条高 7，都不重叠。
+ *   第 0 行 10~17、第 1 行 22~29、第 2 行 34~41、第 3 行 46~53
+ * 底部 55~62 留给说明行。
+ */
+#define OLED_POT_LINE_Y0        (10U)
+#define OLED_POT_LINE_STEP      (12U)
+#define OLED_POT_FOOTER_Y       (55U)
 
-/* 计数块 "K1:0" 放在左右两列 */
-#define OLED_KEY_CNT_X0         (0U)
-#define OLED_KEY_CNT_STEP       (64U)
+/* 每行左侧 "RP1 2048" 共 8 字符 = 48 像素 */
+#define OLED_POT_LABEL_X        (0U)
+
+/* 进度条：从 x=52 画到 x=125，宽 74 像素，高 7 像素 */
+#define OLED_POT_BAR_X0         (52U)
+#define OLED_POT_BAR_X1         (125U)
+#define OLED_POT_BAR_H          (7U)
 
 /* PC13 LED 心跳周期（毫秒） */
 #define LED_HEARTBEAT_MS        (500U)
+
+/* 电位器采样周期（毫秒）。人手拧旋钮，20 ms（50 Hz）足够跟手。 */
+#define POT_SAMPLE_MS           (20U)
+
+/*
+ * 显示死区（LSB）。只有某一路变化超过这个值才重画屏幕。
+ *
+ * 为什么需要：ADC 末位总在抖（±1~2 LSB），若「一变就重画」，旋钮静止时
+ * 屏幕也会以 50 Hz 不停重画整屏（每次约 30 ms 的 I2C 传输），既浪费又
+ * 让末位数字闪个不停。取 8 LSB（满量程的 0.2%）既滤掉噪声，
+ * 又远小于人能分辨的转动幅度。
+ */
+#define POT_DISPLAY_DEADBAND    (8U)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -63,6 +80,8 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc2;
+
 TIM_HandleTypeDef htim1;
 
 /* USER CODE BEGIN PV */
@@ -70,27 +89,23 @@ TIM_HandleTypeDef htim1;
 static ssd1306_t s_oled;
 
 /*
- * 每个键的按下次数。计数是**应用层的策略**，不是驱动的职责——
- * 驱动只负责报「电平」和「边沿」，至于用什么口径统计由应用决定。
+ * 上一次真正画到屏幕上的值。
+ * 用它和最新采样值比较，决定要不要重画——见 POT_DISPLAY_DEADBAND 的说明。
  */
-static uint32_t s_press_count[KEY_ID_COUNT];
-
-/* 最近一次产生按下 / 松开事件的键；KEY_ID_COUNT 表示「还没有过」 */
-static uint8_t s_last_down = (uint8_t)KEY_ID_COUNT;
-static uint8_t s_last_up   = (uint8_t)KEY_ID_COUNT;
+static uint16_t s_shown_raw[POT_ID_COUNT];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM1_Init(void);
+static void MX_ADC2_Init(void);
 /* USER CODE BEGIN PFP */
 static uint8_t oled_u32_to_dec(uint32_t value, char *out);
-static uint8_t str_append(char *dst, uint8_t n, const char *src);
-static void    oled_draw_key_state(uint16_t x, key_id_t id);
-static void    oled_draw_key_count(uint16_t x, uint16_t y, key_id_t id);
+static void    oled_draw_pot_line(uint16_t y, pot_id_t id);
 static void    oled_redraw(void);
-static void    app_poll_keys(void);
+static void    app_drain_key_events(void);
+static void    app_refresh_pots(void);
 static void    app_fatal_blink(uint8_t code);
 /* USER CODE END PFP */
 
@@ -130,153 +145,147 @@ static uint8_t oled_u32_to_dec(uint32_t value, char *out)
 }
 
 /**
-  * @brief  把字符串接到缓冲末尾，返回新的写入位置。
+  * @brief  在指定行画一路电位器：左侧 "RP1 2048"，右侧一条进度条。
+  * @param  y  该行顶部像素坐标
+  * @param  id 电位器编号
   */
-static uint8_t str_append(char *dst, uint8_t n, const char *src)
+static void oled_draw_pot_line(uint16_t y, pot_id_t id)
 {
-  while (*src != '\0') {
-    dst[n] = *src;
-    n++;
-    src++;
+  char           digits[6];
+  char           msg[10];
+  const uint16_t raw = bsp_pot_raw(id);
+  const uint8_t  nd  = oled_u32_to_dec(raw, digits);   /* 1~4 位 */
+  uint8_t        k   = 0U;
+
+  msg[k] = 'R';
+  k++;
+  msg[k] = 'P';
+  k++;
+  msg[k] = (char)('1' + (char)id);
+  k++;
+  msg[k] = ' ';
+  k++;
+
+  /*
+   * 数值右对齐到 4 位，位数不足时前面补空格。
+   * 不补的话 4095 掉到 512 时后面几位会跟着左移，看起来像在「抖」。
+   */
+  for (uint8_t i = 0U; i < (uint8_t)(4U - nd); i++) {
+    msg[k] = ' ';
+    k++;
   }
-  return n;
-}
+  for (uint8_t i = 0U; i < nd; i++) {
+    msg[k] = digits[i];
+    k++;
+  }
+  msg[k] = '\0';
 
-/**
-  * @brief  在指定横向位置画一个按键状态块，形如 "K1[ ]"，按下时显示 "K1[X]"。
-  * @param  id 按键编号，块里的数字和方括号状态都跟着它变
-  */
-static void oled_draw_key_state(uint16_t x, key_id_t id)
-{
-  char block[6];
-
-  block[0] = 'K';
-  block[1] = (char)('1' + (char)id);
-  block[2] = '[';
-  block[3] = bsp_key_is_pressed(id) ? 'X' : ' ';
-  block[4] = ']';
-  block[5] = '\0';
-
-  (void)ssd1306_set_cursor(&s_oled, x, OLED_LINE_STATE_Y);
-  (void)ssd1306_write_string(&s_oled, block, &Font_6x8, SSD1306_WHITE);
-}
-
-/**
-  * @brief  在指定位置画一个按键计数，形如 "K1:12"。
-  */
-static void oled_draw_key_count(uint16_t x, uint16_t y, key_id_t id)
-{
-  char msg[12];
-
-  msg[0] = 'K';
-  msg[1] = (char)('1' + (char)id);
-  msg[2] = ':';
-  (void)oled_u32_to_dec(s_press_count[id], &msg[3]);
-
-  (void)ssd1306_set_cursor(&s_oled, x, y);
+  (void)ssd1306_set_cursor(&s_oled, OLED_POT_LABEL_X, y);
   (void)ssd1306_write_string(&s_oled, msg, &Font_6x8, SSD1306_WHITE);
+
+  /* 进度条外框：空载时也能看出量程有多宽，比只有填充更直观 */
+  ssd1306_draw_rectangle(&s_oled, OLED_POT_BAR_X0, y, OLED_POT_BAR_X1,
+                         (uint16_t)(y + OLED_POT_BAR_H - 1U), SSD1306_WHITE);
+
+  /* 框内可填充的宽度：外框左右各占 1 像素 */
+  const uint16_t inner  = (uint16_t)(OLED_POT_BAR_X1 - OLED_POT_BAR_X0 - 1U);
+  uint32_t       filled = ((uint32_t)raw * inner) / BSP_POT_RAW_MAX;
+
+  if (filled > (uint32_t)inner) {
+    filled = inner;                 /* 读数超出满量程时夹住，防止越界 */
+  }
+
+  if (filled > 0U) {
+    ssd1306_fill_rectangle(&s_oled, (uint16_t)(OLED_POT_BAR_X0 + 1U), (uint16_t)(y + 1U),
+                           (uint16_t)(OLED_POT_BAR_X0 + filled),
+                           (uint16_t)(y + OLED_POT_BAR_H - 2U), SSD1306_WHITE);
+  }
 }
 
 /**
   * @brief  整屏重画并按内容重新上屏。
   *
-  * 每次按键事件都整屏重画，而不是只改变化的那一小块。
-  * 在这个规模下整屏重画更简单、也绝不会留下残影（比如计数从 10 变成 9
-  * 时旧的那一位数字干不掉）。代价是每次约 30 ms 的 I2C 传输，
-  * 按键事件的频率远低于此，完全可以接受。
+  * 整屏重画而不是只改变化的那一块：这个规模下更简单，也绝不会留残影
+  * （比如数值从 1000 掉到 999 时旧的那一位干不掉）。代价是每次约 30 ms
+  * 的 I2C 传输，所以**调用前必须先用死区判断值是否真的变了**
+  * （见 POT_DISPLAY_DEADBAND），否则旋钮静止时屏幕也在以 50 Hz 空刷。
   */
 static void oled_redraw(void)
 {
-  char    buf[24];
-  uint8_t n;
-
   ssd1306_fill(&s_oled, SSD1306_BLACK);
 
   /* 标题 */
   (void)ssd1306_set_cursor(&s_oled, 0U, OLED_LINE_TITLE_Y);
-  (void)ssd1306_write_string(&s_oled, "Key Test", &Font_7x10, SSD1306_WHITE);
+  (void)ssd1306_write_string(&s_oled, "Pot Test", &Font_7x10, SSD1306_WHITE);
 
-  /* 4 个键的实时状态 */
-  for (uint8_t i = 0U; i < (uint8_t)KEY_ID_COUNT; i++) {
-    oled_draw_key_state((uint16_t)(OLED_KEY_STATE_X0 + (i * OLED_KEY_STATE_STEP)),
-                        (key_id_t)i);
+  /* 4 路电位器 */
+  for (uint8_t i = 0U; i < (uint8_t)POT_ID_COUNT; i++) {
+    oled_draw_pot_line((uint16_t)(OLED_POT_LINE_Y0 + (i * OLED_POT_LINE_STEP)), (pot_id_t)i);
   }
 
-  /* 分隔线 */
-  ssd1306_draw_line(&s_oled, 0U, OLED_LINE_RULE_Y, SSD1306_WIDTH - 1U, OLED_LINE_RULE_Y,
-                    SSD1306_WHITE);
-
-  /* 各键按下次数：K1/K2 一行，K3/K4 一行 */
-  oled_draw_key_count(OLED_KEY_CNT_X0, OLED_LINE_CNT_12_Y, KEY_ID_K1);
-  oled_draw_key_count((uint16_t)(OLED_KEY_CNT_X0 + OLED_KEY_CNT_STEP), OLED_LINE_CNT_12_Y,
-                      KEY_ID_K2);
-  oled_draw_key_count(OLED_KEY_CNT_X0, OLED_LINE_CNT_34_Y, KEY_ID_K3);
-  oled_draw_key_count((uint16_t)(OLED_KEY_CNT_X0 + OLED_KEY_CNT_STEP), OLED_LINE_CNT_34_Y,
-                      KEY_ID_K4);
-
-  /* 最近一次按下和松开的键，用来验证两种边沿都被正确上报 */
-  n = str_append(buf, 0U, "down:");
-  if (s_last_down < (uint8_t)KEY_ID_COUNT) {
-    buf[n] = (char)('K');
-    n++;
-    buf[n] = (char)('1' + s_last_down);
-    n++;
-  } else {
-    buf[n] = '-';
-    n++;
-  }
-
-  n = str_append(buf, n, "  up:");
-  if (s_last_up < (uint8_t)KEY_ID_COUNT) {
-    buf[n] = (char)('K');
-    n++;
-    buf[n] = (char)('1' + s_last_up);
-    n++;
-  } else {
-    buf[n] = '-';
-    n++;
-  }
-  buf[n] = '\0';
-
-  (void)ssd1306_set_cursor(&s_oled, 0U, OLED_LINE_EDGE_Y);
-  (void)ssd1306_write_string(&s_oled, buf, &Font_6x8, SSD1306_WHITE);
-
-  /* 消抖参数，静态说明。
-     一行 128 像素 / 每字符 6 像素 = 最多 21 个字符，超了会被 write_string 截断 */
-  (void)ssd1306_set_cursor(&s_oled, 0U, OLED_LINE_INFO_Y);
-  (void)ssd1306_write_string(&s_oled, "debounce 20 ms", &Font_6x8, SSD1306_WHITE);
+  /* 说明行。一行 128 像素 / 每字符 6 像素 = 最多 21 字符，超了会被截断 */
+  (void)ssd1306_set_cursor(&s_oled, 0U, OLED_POT_FOOTER_Y);
+  (void)ssd1306_write_string(&s_oled, "0..4095  Vref 3.3V", &Font_6x8, SSD1306_WHITE);
 
   (void)ssd1306_update_screen(&s_oled);
 }
 
 /**
-  * @brief  轮询 4 个键的事件；有任何变化就重画屏幕。
+  * @brief  把 4 个键的事件取干净。
   *
-  * 事件是边沿，读取即清除。一个键可能同时攒着「按下」和「松开」两个事件
-  * （比如主循环正忙着刷屏时用户完成了一次按放），所以要用 while 取干净。
+  * 本版屏幕整屏给了电位器，按键暂时没有显示位置，但模块本身照常工作
+  * （bsp_key_init() 仍然调用，1 ms 采样与消抖都在跑）。
+  * 这里只是把事件取走，免得 pending 标志一直堆着；
+  * 以后要做「按键翻页」时，把事件接到页切换上即可。
   */
-static void app_poll_keys(void)
+static void app_drain_key_events(void)
 {
-  bool dirty = false;
-
   for (uint8_t i = 0U; i < (uint8_t)KEY_ID_COUNT; i++) {
-    const key_id_t id = (key_id_t)i;
-    key_event_t    ev;
+    while (bsp_key_take_event((key_id_t)i) != KEY_EVENT_NONE) {
+      /* 本版不处理，取走即可 */
+    }
+  }
+}
 
-    while ((ev = bsp_key_take_event(id)) != KEY_EVENT_NONE) {
-      if (ev == KEY_EVENT_PRESS) {
-        s_press_count[i]++;
-        s_last_down = i;
-      } else {
-        s_last_up = i;
-      }
+/**
+  * @brief  按固定周期采样电位器；值变化超过死区才重画屏幕。
+  */
+static void app_refresh_pots(void)
+{
+  static uint32_t last_sample_ms = 0U;
+
+  const uint32_t now_ms = HAL_GetTick();
+  if ((now_ms - last_sample_ms) < POT_SAMPLE_MS) {
+    return;
+  }
+  last_sample_ms = now_ms;
+
+  if (bsp_pot_sample() != ERR_OK) {
+    return;
+  }
+
+  /* 死区判断：任何一路变化超过阈值就重画 */
+  bool dirty = false;
+  for (uint8_t i = 0U; i < (uint8_t)POT_ID_COUNT; i++) {
+    const uint16_t v = bsp_pot_raw((pot_id_t)i);
+    const uint16_t d = (v > s_shown_raw[i]) ? (uint16_t)(v - s_shown_raw[i])
+                                            : (uint16_t)(s_shown_raw[i] - v);
+
+    if (d >= POT_DISPLAY_DEADBAND) {
       dirty = true;
+      break;
     }
   }
 
-  if (dirty) {
-    oled_redraw();
+  if (!dirty) {
+    return;
   }
+
+  for (uint8_t i = 0U; i < (uint8_t)POT_ID_COUNT; i++) {
+    s_shown_raw[i] = bsp_pot_raw((pot_id_t)i);
+  }
+
+  oled_redraw();
 }
 
 /**
@@ -286,6 +295,7 @@ static void app_poll_keys(void)
   *   1 次 = OLED（bsp_oled_init 失败，屏没应答）
   *   2 次 = 系统节拍（bsp_tick_init 失败）
   *   3 次 = 按键（bsp_key_init 失败）
+  *   4 次 = 电位器（bsp_pot_init 失败，ADC 自校准没成功）
   *
   * @note 本函数不返回。
   */
@@ -320,19 +330,18 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
   /* USER CODE END Init */
 
   /* Configure the system clock */
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_TIM1_Init();
+  MX_ADC2_Init();
   /* USER CODE BEGIN 2 */
   /* OLED 挂在 PB8(SCL)/PB9(SDA)，走软件模拟 I2C，由 bsp_oled 自行接管引脚 */
   if (bsp_oled_init(&s_oled) != ERR_OK) {
@@ -350,7 +359,22 @@ int main(void)
     app_fatal_blink(3U);
   }
 
-  /* 画一次初始界面。之后只在按键事件发生时重画。 */
+  /*
+   * 电位器走 ADC2（把 ADC1 留给后面的模块）。
+   * 必须在 CubeMX 生成的 MX_ADC2_Init() 之后调用——
+   * 那边才把通道、采样时间、扫描模式写进寄存器。
+   */
+  if (bsp_pot_init() != ERR_OK) {
+    app_fatal_blink(4U);
+  }
+
+  /* 先采一次，让屏幕第一次画出来就有真实读数而不是全 0 */
+  (void)bsp_pot_sample();
+  for (uint8_t i = 0U; i < (uint8_t)POT_ID_COUNT; i++) {
+    s_shown_raw[i] = bsp_pot_raw((pot_id_t)i);
+  }
+
+  /* 画一次初始界面。之后只在读数变化超过死区时重画。 */
   oled_redraw();
 
   uint32_t last_led_ms = HAL_GetTick();
@@ -358,21 +382,24 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1) {
+  while (1)
+  {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
     /*
-     * 前台主循环只做两件事：处理按键事件、翻 LED。
+     * 前台主循环做三件事：取走按键事件、按周期采电位器、翻 LED。
      *
-     * 注意这里**没有 HAL_Delay**。如果像上一版那样在循环里死等 500 ms，
-     * 按键事件的响应会被拖到最长 500 ms——按一下要过半秒屏幕才动，
-     * 看起来就像按键坏了。所以要改成「查时间、时间到了才做」的非阻塞写法。
+     * 注意这里**没有 HAL_Delay**。在循环里死等会让所有周期性动作
+     * 互相拖累（比如屏幕每 30 ms 刷一次，若用延时来定时，
+     * 电位器的采样周期就变成了「30 ms + 延时」，旋钮跟手感变差）。
+     * 所以一律用「查时间、时间到了才做」的非阻塞写法。
      *
-     * 按键采样本身不在这里：它挂在 1 ms 定时中断上，采样间隔恒定，
-     * 与主循环此刻在忙什么（比如正在花 30 ms 刷屏）无关。
+     * 每次循环只做一次 HAL_GetTick() 比较，几乎不耗时；
+     * 真正干活（采样、刷屏）都由各自的时间条件把关。
      */
-    app_poll_keys();
+    app_drain_key_events();
+    app_refresh_pots();
 
     const uint32_t now_ms = HAL_GetTick();
     if ((now_ms - last_led_ms) >= LED_HEARTBEAT_MS) {
@@ -391,6 +418,7 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -420,6 +448,86 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC2_Init(void)
+{
+
+  /* USER CODE BEGIN ADC2_Init 0 */
+
+  /* USER CODE END ADC2_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC2_Init 1 */
+
+  /* USER CODE END ADC2_Init 1 */
+
+  /** Common config
+  */
+  hadc2.Instance = ADC2;
+  hadc2.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc2.Init.ContinuousConvMode = DISABLE;
+  hadc2.Init.DiscontinuousConvMode = DISABLE;
+  hadc2.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc2.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc2.Init.NbrOfConversion = 1;
+  if (HAL_ADC_Init(&hadc2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_2;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_55CYCLES_5;
+  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_3;
+  sConfig.Rank = ADC_REGULAR_RANK_2;
+  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_4;
+  sConfig.Rank = ADC_REGULAR_RANK_3;
+  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_5;
+  sConfig.Rank = ADC_REGULAR_RANK_4;
+  if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC2_Init 2 */
+
+  /* USER CODE END ADC2_Init 2 */
+
 }
 
 /**
@@ -431,14 +539,12 @@ static void MX_TIM1_Init(void)
 {
 
   /* USER CODE BEGIN TIM1_Init 0 */
-
   /* USER CODE END TIM1_Init 0 */
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
 
   /* USER CODE BEGIN TIM1_Init 1 */
-
   /* USER CODE END TIM1_Init 1 */
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 71;
@@ -463,7 +569,6 @@ static void MX_TIM1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN TIM1_Init 2 */
-
   /* USER CODE END TIM1_Init 2 */
 
 }
@@ -477,14 +582,13 @@ static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
-
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_RESET);
@@ -519,7 +623,6 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
@@ -536,7 +639,8 @@ void Error_Handler(void)
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
-  while (1) {
+  while (1)
+  {
   }
   /* USER CODE END Error_Handler_Debug */
 }
@@ -551,9 +655,8 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line
-     number, ex: printf("Wrong parameters value: file %s on line %d\r\n", file,
-     line) */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */

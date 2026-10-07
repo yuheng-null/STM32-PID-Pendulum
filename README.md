@@ -18,6 +18,7 @@
 - **0.96 寸 OLED（SSD1306，软件 I2C）** —— 第一个功能模块
 - **4 路按键（K1~K4，1 ms 采样 + 消抖）** —— 第二个功能模块
 - **TIM1 1 ms 系统节拍** —— 按键消抖挂在其上，后续 PID 控制环也会复用
+- **4 路电位器（RP1~RP4，ADC2 逐路采样）** —— 第三个功能模块，同时也是第一个模拟量输入
 
 倒立摆本体的机械、传感器、执行器部分**尚未开始**，后续按教程推进。
 
@@ -34,6 +35,7 @@
 | 板载 LED | PC13（低电平点亮） |
 | OLED | 0.96 寸 128×64，SSD1306，4 针 I2C，地址 `0x3C` |
 | 按键 | 4 路独立按键 K1~K4，另一端接 GND，上拉输入（低电平有效） |
+| 电位器 | 4 只卧式旋钮 RP1~RP4，中间抽头接 ADC，两端接 3V3 与 GND |
 
 ### 引脚分配
 
@@ -45,13 +47,21 @@
 | 按键 K2 | PB11 | 输入 + 上拉 |
 | 按键 K3 | PA11 | 输入 + 上拉 |
 | 按键 K4 | PA12 | 输入 + 上拉 |
+| 电位器 RP1 | PA2 | 模拟输入（ADC2_IN2） |
+| 电位器 RP2 | PA3 | 模拟输入（ADC2_IN3） |
+| 电位器 RP3 | PA4 | 模拟输入（ADC2_IN4） |
+| 电位器 RP4 | PA5 | 模拟输入（ADC2_IN5） |
 
 **OLED 接线**：SCL → PB8，SDA → PB9，VCC → 3V3，GND → GND。
 PB8/PB9 不是 STM32F103 的默认 I2C 引脚（I2C1 默认在 PB6/PB7），本项目用**软件模拟 I2C** 驱动。
 
 **按键接线**：一端接引脚，另一端接 GND。引脚配成上拉输入，因此不按为高、按下为低。
 
-> 以上 6 个引脚**全部在 [PID_Pendulum.ioc](PID_Pendulum.ioc) 里声明**，由 CubeMX 生成配置代码。
+**电位器接线**：每只电位器**三个脚都要接**——两端分别接 3V3 与 GND，中间抽头接 ADC 引脚。
+抽头对地电压随旋钮在 0~3.3 V 之间连续变化，ADC 把它量化成 0~4095。
+两端接反则读数方向相反；只接两端不接抽头则读数恒为 0 或恒为满量程。
+
+> 以上 10 个引脚**全部在 [PID_Pendulum.ioc](PID_Pendulum.ioc) 里声明**，由 CubeMX 生成配置代码。
 > `bsp/` 里的模块只引用生成的 `KEY1_Pin` / `OLED_SCL_Pin` 之类的宏，不自己写引脚定义——
 > 这样以后在 CubeMX 里加外设时，CubeMX 会在配置阶段就发现引脚冲突，
 > 而不是等到运行时才发现两个功能抢同一个脚。
@@ -70,7 +80,7 @@ Flash latency: 2 WS
 
 ### 资源占用
 
-Debug 构建下：FLASH 16512 B / 64 KB（25.2%），RAM 2808 B / 20 KB（13.7%）。
+Debug 构建下：FLASH 20868 B / 64 KB（31.8%），RAM 2864 B / 20 KB（14.0%）。
 
 ---
 
@@ -117,12 +127,13 @@ HAL        Drivers/           ST 的 HAL 与 CMSIS
 ├── bsp/
 │   ├── oled/                   板载 OLED 的组装
 │   ├── key/                    4 路按键：消抖、事件上报
+│   ├── pot/                    4 路电位器：ADC2 逐路采样、原始值/电压换算
 │   └── tick/                   TIM1 1ms 系统节拍，供各模块挂载周期任务
 ├── driver/
 │   ├── common/error.h          统一错误码 error_t
 │   ├── bus/i2c/                软件模拟 I2C 总线
 │   └── device/ssd1306/         SSD1306 器件驱动 + 字库
-├── docs/                       模块实现详解（oled.md / key.md）
+├── docs/                       模块实现详解（oled.md / key.md / pot.md）
 ├── Drivers/
 │   ├── CMSIS/                  ARM CMSIS 内核与设备头文件（第三方，Apache-2.0）
 │   └── STM32F1xx_HAL_Driver/   ST HAL 驱动（第三方，BSD-3-Clause）
@@ -155,7 +166,16 @@ HAL        Drivers/           ST 的 HAL 与 CMSIS
 
 总线速度约 400 kHz，刷新一屏（1024 字节）约二十几毫秒，对显示用途完全够用。
 
-软件 I2C 直接接管 PB8/PB9 的 GPIO 配置（开漏 + 上拉），**没有**在 CubeMX 里把这两个引脚配成 GPIO_Output —— 位翻转总线的引脚时序属于总线实现的一部分，由总线驱动自己配置更内聚，也避免 CubeMX 重新生成时把模式改回推挽。
+**PB8/PB9 这两个引脚在 `.ioc` 里是有声明的**（`Signal=GPIO_Output`，模式开漏 + 上拉），由 CubeMX 生成到 `MX_GPIO_Init()`。声明的作用是**占位**：让 CubeMX 在配置阶段就知道这两个脚已被占用，以后加外设时不会静默抢走它们。
+
+而软件 I2C 在 `i2c_soft_init()` 里会**按同样的电气参数再配一遍**。看起来重复，这是有意的取舍：
+
+| | 谁配 | 为什么 |
+| --- | --- | --- |
+| `.ioc` / `MX_GPIO_Init()` | CubeMX | 声明的唯一来源，负责占位与冲突检测 |
+| `i2c_soft_gpio_config()` | 总线驱动 | 「开漏 + 上拉」是 I2C 协议的一部分，总线驱动必须自包含，才能脱离 CubeMX 换引脚复用、也才能在 PC 上用假总线做单元测试 |
+
+代价是**两处电气参数必须保持一致**（开漏 / 上拉 / 高速），改一处就要改另一处。这是本工程唯一一处有意保留的双份配置，其余引脚一律只听 CubeMX 的。
 
 > 用位翻转读 SDA 依赖 STM32F1 的一个特性：GPIO 处于输出模式时输入通道依然有效，因此把 SDA 配成开漏输出后可以直接读回线路真实电平，不必在输入/输出模式间来回切换。
 
@@ -261,9 +281,103 @@ bool        bsp_key_is_pressed(key_id_t id);   /* 当前是否按着（电平）
 
 ---
 
+## 模块：电位器（RP1~RP4）
+
+> **完整的实现原理讲解见 [docs/pot.md](docs/pot.md)** —— 从 ADC 基础讲到每一段代码在做什么，含这次踩过的全部坑。
+
+### 核心难点：STM32F1 的多通道 ADC 不能靠轮询逐路读
+
+这是本模块最值得记的一条，依据是两处第一手材料：
+
+> **RM0008 对 `SR.EOC` 的定义**是 "end of a **group** channel conversion"；
+> **HAL 源码**里也写着 `As flag EOC is not set after each conversion`。
+>
+> 即：**扫描模式下 EOC 是"整组转换结束"才置位一次，不是每路一次**。
+> `DR` 里永远只有最后一路的结果。想逐路取数，硬件上**只有 DMA 一条路**
+> （RM0008：`When using scan mode, DMA bit must be set…`）。
+
+而 **STM32F103 的 ADC2 没有 DMA 请求**（DMA1 请求表只挂了 ADC1；C8T6 又是中容量，
+没有 DMA2）。所以本模块的方案是：**不用扫描模式，序列长度设为 1，一次只转一路**，
+读之前用 `HAL_ADC_ConfigChannel()` 把 rank 1 切成目标通道。
+
+顺带一个好处：序列长度是 1 时，`HAL_ADC_PollForConversion()` 内部会命中
+"真正等 EOC"那条分支，可以直接用（扫描模式下它是不可用的）。
+
+### 分层
+
+| 文件 | 职责 |
+| --- | --- |
+| [bsp/pot/bsp_pot.c](bsp/pot/bsp_pot.c) | 自校准、逐路采样、原始值/电压换算 |
+| [PID_Pendulum.ioc](PID_Pendulum.ioc) | ADC2 的声明（4 通道、扫描关闭、序列长度 1） |
+| `Core/Src/main.c` 生成部分 | `MX_ADC2_Init()`、ADC 时钟分频 |
+| `Core/Src/stm32f1xx_hal_msp.c` | ADC2 时钟使能、PA2~PA5 配成模拟输入 |
+
+### API
+
+```c
+error_t  bsp_pot_init(void);                 /* 自校准，必须在 MX_ADC2_Init() 之后 */
+error_t  bsp_pot_sample(void);               /* 采一次，4 路写进缓存（约 23 µs） */
+uint16_t bsp_pot_raw(pot_id_t id);           /* 0~4095 */
+uint16_t bsp_pot_millivolt(pot_id_t id);     /* 0~3300 mV */
+```
+
+**为什么"采样"和"读数"分开**：4 路共用一个 `DR`，ADC 是一问一答的。
+若让 `bsp_pot_raw()` 自己触发转换，连续读 4 次就是 4 次硬件动作，
+而且 4 个值来自 4 个不同瞬间——旋钮在转时会出现"撕裂"。
+
+### 烧录后屏幕应该显示什么
+
+```
+┌────────────────────────────┐
+│ Pot Test                   │
+│ RP1 2198  ████████████████░ │  ← 数字右对齐，进度条按比例
+│ RP2 2878  ████████████████░ │
+│ RP3 1898  █████████████░░░░ │
+│ RP4 1259  ██████████░░░░░░░ │
+│ 0..4095  Vref 3.3V         │
+└────────────────────────────┘
+```
+
+- **拧某个旋钮，只有它那一行的数字和进度条变**（四路独立）
+- 不拧的时候数字**不抖**——死区 8 LSB 滤掉了 ADC 末位噪声，屏幕也不会空刷
+- 拧到两端分别显示约 0 和 4095
+
+若某个旋钮拧了没反应：先确认它是**三个脚都接好**（两端 3V3/GND、中间抽头接 ADC 引脚）。
+只接两端不接抽头、或 3V3 那端没接上，都会读数异常。
+
+---
+
 ## 修改 CubeMX 配置
 
 [PID_Pendulum.ioc](PID_Pendulum.ioc) 是**硬件配置的唯一来源**：引脚分配、电气模式、外设参数、中断使能都记在里面，`Core/` 下的初始化代码全部由它生成。要加外设、改引脚，都是改它然后重新生成。
+
+### 总原则：CubeMX 能生成的，一律让 CubeMX 生成
+
+**绝不手写会被重新生成覆盖的内容。** 手写代码和生成代码争夺同一份事实（引脚模式、外设参数、初始化顺序）时，两边必然漂移；而重新生成是**静默**的——不报错、不警告，直接改回去或丢掉，事后极难排查。
+
+具体到本工程，分工是这样划的：
+
+| 内容 | 归谁 |
+| --- | --- |
+| 引脚分配 / 电气模式 / 标签 | `.ioc`（唯一来源） |
+| 外设参数（PSC、ARR……）、时钟树 | `.ioc` |
+| `MX_xxx_Init()`、MSP、`HAL_NVIC_EnableIRQ()` | CubeMX 生成 |
+| `HAL_xxx_MODULE_ENABLED`（[stm32f1xx_hal_conf.h](Core/Inc/stm32f1xx_hal_conf.h)） | CubeMX 生成 |
+| [cmake/stm32cubemx/CMakeLists.txt](cmake/stm32cubemx/CMakeLists.txt) 源文件清单 | CubeMX 生成 |
+| 中断服务函数（`TIM1_UP_IRQHandler` 等） | CubeMX 生成 |
+| 模块逻辑（消抖、显存、PID……） | 手写，放 `bsp/` `driver/`，或生成文件的 `USER CODE` 块 |
+
+引脚一律用生成的宏（`KEY1_Pin` / `KEY1_GPIO_Port`）引用，不硬编码端口和位号。
+
+**判断某个文件会不会被覆盖**：CubeMX 用根目录的 [.mxproject](.mxproject) 记录它生成过的文件（`[PreviousGenFiles]` 段）。不在那个名单里的文件——比如顶层 [CMakeLists.txt](CMakeLists.txt)——不会被重新生成覆盖，可以放心手写。目前名单里是这 6 个：
+
+```
+Core/Inc/main.h            Core/Src/main.c
+Core/Inc/stm32f1xx_it.h    Core/Src/stm32f1xx_it.c
+Core/Inc/stm32f1xx_hal_conf.h   Core/Src/stm32f1xx_hal_msp.c
+```
+
+> 注：`Drivers/`、`startup_stm32f103xb.s`、`STM32F103XX_FLASH.ld` 不在 `[PreviousGenFiles]` 里，但同样会被生成覆盖，不要改。
 
 ### ⚠️ 不要手改 `.ioc` 来「加外设」
 
