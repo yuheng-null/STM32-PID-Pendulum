@@ -10,12 +10,14 @@
 
 ## 当前进度
 
-初始工程骨架，已完成：
+已完成的模块：
 
 - CubeMX 工程搭建（.ioc）、时钟树配置、SWD 调试引脚
 - CMake + Ninja 构建系统，可由 STM32CubeIDE for VSCode 直接构建
 - 板载 LED（PC13）1 Hz 闪烁 —— 用于验证「编译 → 烧录 → 运行」链路通了
-- **0.96 寸 OLED（SSD1306，软件 I2C）** —— 第一个功能模块，见下文
+- **0.96 寸 OLED（SSD1306，软件 I2C）** —— 第一个功能模块
+- **4 路按键（K1~K4，1 ms 采样 + 消抖）** —— 第二个功能模块
+- **TIM1 1 ms 系统节拍** —— 按键消抖挂在其上，后续 PID 控制环也会复用
 
 倒立摆本体的机械、传感器、执行器部分**尚未开始**，后续按教程推进。
 
@@ -31,17 +33,28 @@
 | 调试接口 | SWD（PA13 / PA14） |
 | 板载 LED | PC13（低电平点亮） |
 | OLED | 0.96 寸 128×64，SSD1306，4 针 I2C，地址 `0x3C` |
+| 按键 | 4 路独立按键 K1~K4，另一端接 GND，上拉输入（低电平有效） |
 
-### OLED 接线
+### 引脚分配
 
-| OLED 引脚 | 接到 | 说明 |
+| 功能 | 引脚 | 电气模式 |
 | --- | --- | --- |
-| SCL | **PB8** | 软件模拟 I2C 时钟 |
-| SDA | **PB9** | 软件模拟 I2C 数据 |
-| VCC | 3V3 | 模块内部有电荷泵，接 3.3V 即可 |
-| GND | GND | |
+| OLED SCL | PB8 | 开漏输出 + 上拉（软件 I2C） |
+| OLED SDA | PB9 | 开漏输出 + 上拉（软件 I2C） |
+| 按键 K1 | PB10 | 输入 + 上拉 |
+| 按键 K2 | PB11 | 输入 + 上拉 |
+| 按键 K3 | PA11 | 输入 + 上拉 |
+| 按键 K4 | PA12 | 输入 + 上拉 |
 
-PB8/PB9 并不是 STM32F103 的默认 I2C 引脚（I2C1 默认在 PB6/PB7），本项目用**软件模拟 I2C** 驱动，原因见下文。
+**OLED 接线**：SCL → PB8，SDA → PB9，VCC → 3V3，GND → GND。
+PB8/PB9 不是 STM32F103 的默认 I2C 引脚（I2C1 默认在 PB6/PB7），本项目用**软件模拟 I2C** 驱动。
+
+**按键接线**：一端接引脚，另一端接 GND。引脚配成上拉输入，因此不按为高、按下为低。
+
+> 以上 6 个引脚**全部在 [PID_Pendulum.ioc](PID_Pendulum.ioc) 里声明**，由 CubeMX 生成配置代码。
+> `bsp/` 里的模块只引用生成的 `KEY1_Pin` / `OLED_SCL_Pin` 之类的宏，不自己写引脚定义——
+> 这样以后在 CubeMX 里加外设时，CubeMX 会在配置阶段就发现引脚冲突，
+> 而不是等到运行时才发现两个功能抢同一个脚。
 
 ### 时钟树
 
@@ -57,7 +70,7 @@ Flash latency: 2 WS
 
 ### 资源占用
 
-Debug 构建下：FLASH 4704 B / 64 KB（7.18%），RAM 1584 B / 20 KB（7.73%）。
+Debug 构建下：FLASH 16512 B / 64 KB（25.2%），RAM 2808 B / 20 KB（13.7%）。
 
 ---
 
@@ -102,11 +115,14 @@ HAL        Drivers/           ST 的 HAL 与 CMSIS
 │   ├── Inc/                    应用头文件（main.h、HAL 配置、中断声明）
 │   └── Src/                    应用源码（main.c、中断处理、syscalls 等）
 ├── bsp/
-│   └── oled/                   板载 OLED 的接线与组装
+│   ├── oled/                   板载 OLED 的组装
+│   ├── key/                    4 路按键：消抖、事件上报
+│   └── tick/                   TIM1 1ms 系统节拍，供各模块挂载周期任务
 ├── driver/
 │   ├── common/error.h          统一错误码 error_t
 │   ├── bus/i2c/                软件模拟 I2C 总线
 │   └── device/ssd1306/         SSD1306 器件驱动 + 字库
+├── docs/                       模块实现详解（oled.md / key.md）
 ├── Drivers/
 │   ├── CMSIS/                  ARM CMSIS 内核与设备头文件（第三方，Apache-2.0）
 │   └── STM32F1xx_HAL_Driver/   ST HAL 驱动（第三方，BSD-3-Clause）
@@ -175,6 +191,136 @@ HAL        Drivers/           ST 的 HAL 与 CMSIS
 - **`scan: 0x3C ok`** 是开机时的总线自检结果。这一行是整个模块最有信息量的地方：能扫到 0x3C 说明 PB8/PB9 接线、上拉、位翻转时序、地址全部正确。若这里是 `scan: 0 dev!` 或整屏空白，就是接线或时序有问题。
 - **`loop: N`** 每个主循环节拍 +1，与 PC13 LED 同节奏（500 ms 一次）。LED 闪一下、数字跳一下；两者节奏不一致就说明主循环某处被阻塞了。
 - 若屏幕**完全没有反应**，固件会让 LED 以 10 Hz 快闪作为错误指示（`bsp_oled_init` 返回失败）——这样"黑屏"就能区分是屏幕没通、还是代码没跑到。
+
+---
+
+## 模块：按键（K1~K4）
+
+> **完整的实现原理讲解见 [docs/key.md](docs/key.md)** —— 电气原理、消抖算法推演、跨上下文的事件机制、以及怎么在没有摄像头的情况下验证。
+
+### 三个必须解决的问题
+
+按键看似最简单，实际要处理三件事，每件都有陷阱：
+
+| 需求 | 陷阱 | 做法 |
+| --- | --- | --- |
+| 读出「是否按下」 | 引脚不按时**悬空**，电平不确定 | 引脚内部上拉，按下接 GND |
+| 过滤机械弹跳 | 触点闭合瞬间抖动 1~5 ms，一次按下读成十几次 | 1 ms 采样 + 连续 20 次一致才认 |
+| 让应用知道「发生了什么」 | 只给电平，应用会漏掉快速按放 | 中断捕获**边沿**，主循环取走 |
+
+### 为什么采样必须在 1 ms 中断里
+
+刷一次屏要 30 ms，这期间主循环一次都没跑。而人按键约 50~200 ms——**如果整段落在刷屏期间，这次按下就被完全漏掉**，表现为偶发的「按键没反应」。
+
+挂到 TIM1 的 1 ms 节拍上之后，采样间隔恒定，与主循环在忙什么无关。这也是**消抖能成立的前提**：消抖算的是「连续 20 次」，采样间隔如果忽长忽短，「20 次」对应的物理时间就不固定了。
+
+### 分层
+
+| 文件 | 职责 |
+| --- | --- |
+| [bsp/key/bsp_key.c](bsp/key/bsp_key.c) | 消抖状态机、事件上报。**不配置引脚** |
+| [bsp/tick/bsp_tick.c](bsp/tick/bsp_tick.c) | TIM1 的 1 ms 中断与任务分发 |
+| [PID_Pendulum.ioc](PID_Pendulum.ioc) | 4 个引脚的声明（上拉输入 + 标签） |
+| `Core/Src/main.c` 生成部分 | `MX_GPIO_Init()` 里真正的引脚配置 |
+
+**1 ms 节拍单独抽一层**，是因为它是系统基础设施而非按键的私产——后续 PID 控制环、传感器采样都会挂上来。接口就一个：
+
+```c
+error_t bsp_tick_register(bsp_tick_fn_t fn);   /* 挂一个 1ms 周期任务 */
+```
+
+### API
+
+```c
+key_event_t bsp_key_take_event(key_id_t id);   /* 取走事件（边沿，读取即清除） */
+bool        bsp_key_is_pressed(key_id_t id);   /* 当前是否按着（电平） */
+```
+
+两种查询各有用途：`is_pressed` 回答「现在按着没有」（长按、组合键），`take_event` 回答「刚刚发生了什么」（计次、翻页）。只给电平的话，应用得自己记住上次状态来推断边沿——每个应用都要重写一遍，而且会漏事件。
+
+### 烧录后屏幕应该显示什么
+
+```
+┌────────────────────────────┐
+│ Key Test                   │
+│ K1[ ] K2[ ] K3[ ] K4[ ]    │  ← 按下时方括号里显示 X
+│ ──────────────────────────  │
+│ K1:0        K2:0           │  ← 各键按下次数
+│ K3:0        K4:0           │
+│ down:-  up:-               │  ← 最近按下 / 松开的键
+│ debounce 20 ms             │
+└────────────────────────────┘
+```
+
+- 按下 K1：屏幕变成 `K1[X]` / `K1:1` / `down:K1`；松开后 `K1[X]` 变回 `K1[ ]`，并显示 `up:K1`
+- **屏幕静止是正常的**——只在按键事件发生时重画，不按键就不动
+- PC13 LED 每 500 ms 翻转一次，是「主循环还活着」的心跳
+- 若某个模块初始化失败，LED 用闪烁次数指示是哪个（1 次=OLED，2 次=节拍，3 次=按键）
+
+**如果实现反了**（不按显示 X、按了反而空）：说明按键是「按下接高电平」，改 [bsp_key.c](bsp/key/bsp_key.c) 里 `BSP_KEY_ACTIVE_LEVEL` 为 `GPIO_PIN_SET`，并同步把 `.ioc` 里四个引脚改成下拉。
+
+---
+
+## 修改 CubeMX 配置
+
+[PID_Pendulum.ioc](PID_Pendulum.ioc) 是**硬件配置的唯一来源**：引脚分配、电气模式、外设参数、中断使能都记在里面，`Core/` 下的初始化代码全部由它生成。要加外设、改引脚，都是改它然后重新生成。
+
+### ⚠️ 不要手改 `.ioc` 来「加外设」
+
+在 `.ioc` 里手写 `Mcu.IP3=TIM1` + `TIM1.Prescaler=71` 这种写法，**CubeMX 加载后会把整块静默丢弃**——不报错、不警告，`Mcu.IPNb` 还会退回原值。实测换键名、换位置、按字母序排列都没用。
+
+原因：`.ioc` 是 CubeMX **内部状态的序列化**。`Mcu.IPn` 不是开关，而是「该外设已被激活」这个事实的记录。手写这个记录，CubeMX 重建不出对应状态就扔掉。
+
+**外设必须通过 CubeMX 自己的接口激活。** 手改只适用于「改已有外设的参数」（改个 PSC、改个时钟源），而且改完必须验证。
+
+### 两条可行路径
+
+**路径 A：CubeMX GUI** —— 打开 `.ioc`，改配置，点 GENERATE CODE。最省心，GUI 会自己维护 `.ioc` 里那些白名单。
+
+**路径 B：命令行** —— CubeMX 的脚本模式（`-q <脚本>`）支持 `set` 命令，可以全自动完成：
+
+```text
+config load "<工程目录>\PID_Pendulum.ioc"
+set mode TIM1 "Internal Clock"            # 激活外设（模式名有空格要加引号）
+set ip parameters TIM1 Prescaler 71
+set ip parameters TIM1 Period 999
+set pin PB10 GPIO_Input
+set gpio parameters PB10 GPIO_PuPd GPIO_PULLUP
+set gpio parameters PB10 GPIO_Label KEY1
+config saveas "<工程目录>\PID_Pendulum.ioc"
+project generate
+exit                                      # 漏了这行 CubeMX 会挂住不退出
+```
+
+两个会让 CubeMX 卡住的坑：**路径含空格必须加引号**（不加会静默返回 KO）；**最后一行必须是 `exit`**。
+
+> 想确认某个命令的语法，可以写个只有 `help`（或 `set`、`get`）的脚本跑一遍，CubeMX 会把用法打出来——比搜网页权威。
+> `get modes <外设>` 能列出该外设所有可选模式名，**别猜名字**。
+
+### 改完必须验证
+
+无论走哪条路径，改完 `.ioc` 后都要让 CubeMX 做一次「加载 → 另存」往返，看有没有键被丢弃或改写：
+
+```bash
+# 借助 stm32-hal-modify skill 的脚本（或 stm32-hal-init 的 roundtrip）
+python <skills>/stm32-hal-modify/scripts/cubemx_cfg.py roundtrip "<工程目录>"
+```
+
+看到 `OK: 写的参数全部被 CubeMX 原样保留了` 才算参数被接受。
+
+**注意「参数被接受」≠「代码被生成」**——还要去生成的 `.c` 里逐项找到对应代码（`MX_xxx_Init()`、`HAL_NVIC_EnableIRQ()`、`GPIO_InitStruct.Mode`）。这套工具链最典型的失败模式就是：所有命令都返回成功，硬件毫无反应。
+
+### CubeMX 重新生成时，什么会保留
+
+| 内容 | 结果 |
+| --- | --- |
+| `/* USER CODE BEGIN */` ~ `END` 之间的内容 | ✅ 保留 |
+| 自己新增的目录（`bsp/`、`driver/`、`docs/`） | ✅ 保留（CubeMX 完全不管） |
+| 顶层 `CMakeLists.txt` / `CMakePresets.json` | ✅ 保留（CubeMX 只生成一次） |
+| `.vscode/` / `build/` | ✅ 保留 |
+| `Core/`、`Drivers/`、`cmake/stm32cubemx/` | ⚠️ **会被重写** |
+
+**由此得出的纪律**：业务代码要么写进 `USER CODE` 段，要么放进自己新增的目录。直接改 `Core/` 里 `USER CODE` 之外的地方，下次生成就没了。
 
 ---
 

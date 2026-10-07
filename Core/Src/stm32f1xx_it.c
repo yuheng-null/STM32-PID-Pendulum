@@ -22,6 +22,7 @@
 #include "stm32f1xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "bsp_tick.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -55,7 +56,7 @@
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
-
+extern TIM_HandleTypeDef htim1;
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -198,6 +199,25 @@ void SysTick_Handler(void)
 /* please refer to the startup file (startup_stm32f1xx.s).                    */
 /******************************************************************************/
 
-/* USER CODE BEGIN 1 */
+/**
+  * @brief This function handles TIM1 update interrupt.
+  */
+void TIM1_UP_IRQHandler(void)
+{
+  /* USER CODE BEGIN TIM1_UP_IRQn 0 */
 
+  /* USER CODE END TIM1_UP_IRQn 0 */
+  HAL_TIM_IRQHandler(&htim1);
+  /* USER CODE BEGIN TIM1_UP_IRQn 1 */
+
+  /* USER CODE END TIM1_UP_IRQn 1 */
+}
+
+/* USER CODE BEGIN 1 */
+/*
+ * TIM1 的更新中断服务函数现在由 CubeMX 生成（见上面的 TIM1_UP_IRQHandler），
+ * 它调用 HAL_TIM_IRQHandler(&htim1) → HAL_TIM_PeriodElapsedCallback()。
+ * 1 ms 节拍的分发就在那个回调里（bsp/tick/bsp_tick.c），
+ * 因此本处不再需要手写中断服务函数，写了反而会与 CubeMX 生成的重复定义。
+ */
 /* USER CODE END 1 */

@@ -54,6 +54,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/driver/device/ssd1306/ssd1306.c
     ${CMAKE_CURRENT_SOURCE_DIR}/driver/device/ssd1306/ssd1306_fonts.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/oled/bsp_oled.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/tick/bsp_tick.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/key/bsp_key.c
 )
 
 # Add include paths
@@ -62,6 +64,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/driver/bus/i2c
     ${CMAKE_CURRENT_SOURCE_DIR}/driver/device/ssd1306
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/oled
+    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/tick
+    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/key
 )
 
 # Add project symbols (macros)
