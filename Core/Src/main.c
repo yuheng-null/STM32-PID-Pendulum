@@ -28,6 +28,10 @@
 #include "bsp_tick.h"
 #include "bsp_key.h"
 #include "bsp_pot.h"
+#include "bsp_serial.h"
+
+/* printf 走 bsp_serial 的发送缓冲（_write 已在那里重定向） */
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -84,6 +88,8 @@ ADC_HandleTypeDef hadc2;
 
 TIM_HandleTypeDef htim1;
 
+UART_HandleTypeDef huart1;
+
 /* USER CODE BEGIN PV */
 /* OLED 设备实例（含 1 KB 显存），文件级静态，不占栈 */
 static ssd1306_t s_oled;
@@ -100,12 +106,14 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_ADC2_Init(void);
+static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static uint8_t oled_u32_to_dec(uint32_t value, char *out);
 static void    oled_draw_pot_line(uint16_t y, pot_id_t id);
 static void    oled_redraw(void);
 static void    app_drain_key_events(void);
 static void    app_refresh_pots(void);
+static void    app_serial_service(void);
 static void    app_fatal_blink(uint8_t code);
 /* USER CODE END PFP */
 
@@ -289,6 +297,46 @@ static void app_refresh_pots(void)
 }
 
 /**
+  * @brief  串口自检服务：回显收到的字节，并按周期发一行状态。
+  *
+  * ⚠️ 这是**临时验证代码**，用来证明串口双向都通，验证完可以整块删掉。
+  *
+  * 它同时验证三件事：
+  *   1. 发送链路 —— 每 500 ms 发一行，PC 端能读到就说明 TX 通；
+  *   2. 接收链路 —— 收到的字节原样回显，PC 端发什么就收回什么；
+  *   3. printf 重定向 —— 那一行就是用 printf 拼的，能出来说明 _write 接对了。
+  *
+  * 回显这段顺带说明了一个正确的读法：**有多少取多少**，
+  * 不假设「一条命令一次到齐」——串口是按字节流来的，
+  * 一次 bsp_serial_read() 可能只拿到半个报文，也可能拿到两条半。
+  */
+static void app_serial_service(void)
+{
+  static uint32_t last_tx_ms = 0U;
+  static uint32_t counter    = 0U;
+
+  /* 收到的字节原样回显，证明接收链路通 */
+  uint8_t        echo[32];
+  const uint32_t n = bsp_serial_read(echo, (uint32_t)sizeof(echo));
+  if (n > 0U) {
+    (void)bsp_serial_write(echo, n);
+  }
+
+  /* 每 500 ms 发一行：计数器 + 4 路电位器原始值 */
+  const uint32_t now_ms = HAL_GetTick();
+  if ((now_ms - last_tx_ms) >= 500U) {
+    last_tx_ms = now_ms;
+    counter++;
+    printf("PID_Pendulum tick=%u rp1=%u rp2=%u rp3=%u rp4=%u\r\n",
+           (unsigned int)counter,
+           (unsigned int)bsp_pot_raw(POT_ID_RP1),
+           (unsigned int)bsp_pot_raw(POT_ID_RP2),
+           (unsigned int)bsp_pot_raw(POT_ID_RP3),
+           (unsigned int)bsp_pot_raw(POT_ID_RP4));
+  }
+}
+
+/**
   * @brief  初始化失败时的错误指示：快闪 code 次，停 1 秒，循环。
   *
   * 闪烁次数对应失败的模块，便于不用调试器就定位问题：
@@ -296,6 +344,7 @@ static void app_refresh_pots(void)
   *   2 次 = 系统节拍（bsp_tick_init 失败）
   *   3 次 = 按键（bsp_key_init 失败）
   *   4 次 = 电位器（bsp_pot_init 失败，ADC 自校准没成功）
+  *   5 次 = 串口（bsp_serial_init 失败，接收中断没武装上）
   *
   * @note 本函数不返回。
   */
@@ -342,6 +391,7 @@ int main(void)
   MX_GPIO_Init();
   MX_TIM1_Init();
   MX_ADC2_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   /* OLED 挂在 PB8(SCL)/PB9(SDA)，走软件模拟 I2C，由 bsp_oled 自行接管引脚 */
   if (bsp_oled_init(&s_oled) != ERR_OK) {
@@ -366,6 +416,15 @@ int main(void)
    */
   if (bsp_pot_init() != ERR_OK) {
     app_fatal_blink(4U);
+  }
+
+  /*
+   * 串口。必须在 CubeMX 生成的 MX_USART1_UART_Init() 之后调用——
+   * 那边才把波特率、字长、校验这些寄存器配置写下去，
+   * 本模块只负责把接收中断武装起来。
+   */
+  if (bsp_serial_init() != ERR_OK) {
+    app_fatal_blink(5U);
   }
 
   /* 先采一次，让屏幕第一次画出来就有真实读数而不是全 0 */
@@ -400,6 +459,7 @@ int main(void)
      */
     app_drain_key_events();
     app_refresh_pots();
+    app_serial_service();
 
     const uint32_t now_ms = HAL_GetTick();
     if ((now_ms - last_led_ms) >= LED_HEARTBEAT_MS) {
@@ -570,6 +630,39 @@ static void MX_TIM1_Init(void)
   }
   /* USER CODE BEGIN TIM1_Init 2 */
   /* USER CODE END TIM1_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
 
 }
 

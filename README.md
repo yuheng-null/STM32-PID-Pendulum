@@ -19,6 +19,7 @@
 - **4 路按键（K1~K4，1 ms 采样 + 消抖）** —— 第二个功能模块
 - **TIM1 1 ms 系统节拍** —— 按键消抖挂在其上，后续 PID 控制环也会复用
 - **4 路电位器（RP1~RP4，ADC2 逐路采样）** —— 第三个功能模块，同时也是第一个模拟量输入
+- **串口（USART1，双向中断 + 环形缓冲）** —— 第四个功能模块，供后续调参与上报数据
 
 倒立摆本体的机械、传感器、执行器部分**尚未开始**，后续按教程推进。
 
@@ -36,6 +37,7 @@
 | OLED | 0.96 寸 128×64，SSD1306，4 针 I2C，地址 `0x3C` |
 | 按键 | 4 路独立按键 K1~K4，另一端接 GND，上拉输入（低电平有效） |
 | 电位器 | 4 只卧式旋钮 RP1~RP4，中间抽头接 ADC，两端接 3V3 与 GND |
+| 串口 | USART1，PA9/PA10，115200-8-N-1，接 USB-TTL（CH340） |
 
 ### 引脚分配
 
@@ -51,6 +53,8 @@
 | 电位器 RP2 | PA3 | 模拟输入（ADC2_IN3） |
 | 电位器 RP3 | PA4 | 模拟输入（ADC2_IN4） |
 | 电位器 RP4 | PA5 | 模拟输入（ADC2_IN5） |
+| 串口 TX | PA9 | 复用推挽（USART1_TX） |
+| 串口 RX | PA10 | 浮空输入（USART1_RX） |
 
 **OLED 接线**：SCL → PB8，SDA → PB9，VCC → 3V3，GND → GND。
 PB8/PB9 不是 STM32F103 的默认 I2C 引脚（I2C1 默认在 PB6/PB7），本项目用**软件模拟 I2C** 驱动。
@@ -61,7 +65,10 @@ PB8/PB9 不是 STM32F103 的默认 I2C 引脚（I2C1 默认在 PB6/PB7），本�
 抽头对地电压随旋钮在 0~3.3 V 之间连续变化，ADC 把它量化成 0~4095。
 两端接反则读数方向相反；只接两端不接抽头则读数恒为 0 或恒为满量程。
 
-> 以上 10 个引脚**全部在 [PID_Pendulum.ioc](PID_Pendulum.ioc) 里声明**，由 CubeMX 生成配置代码。
+**串口接线**：MCU 的 PA9(TX) 接 USB-TTL 的 RX，PA10(RX) 接 USB-TTL 的 TX，**GND 必须共地**。
+TX 接 TX 的现象是「两边都收不到，且不报任何错」。
+
+> 以上 12 个引脚**全部在 [PID_Pendulum.ioc](PID_Pendulum.ioc) 里声明**，由 CubeMX 生成配置代码。
 > `bsp/` 里的模块只引用生成的 `KEY1_Pin` / `OLED_SCL_Pin` 之类的宏，不自己写引脚定义——
 > 这样以后在 CubeMX 里加外设时，CubeMX 会在配置阶段就发现引脚冲突，
 > 而不是等到运行时才发现两个功能抢同一个脚。
@@ -80,7 +87,10 @@ Flash latency: 2 WS
 
 ### 资源占用
 
-Debug 构建下：FLASH 20868 B / 64 KB（31.8%），RAM 2864 B / 20 KB（14.0%）。
+Debug 构建下：FLASH 29616 B / 64 KB（45.2%），RAM 3912 B / 20 KB（19.1%）。
+
+其中串口模块贡献约 +8.7 KB Flash（主要是 newlib 的 `printf` 格式化代码）
+和 +1 KB RAM（两个 256 字节环形缓冲 + HAL 句柄）。
 
 ---
 
@@ -128,12 +138,13 @@ HAL        Drivers/           ST 的 HAL 与 CMSIS
 │   ├── oled/                   板载 OLED 的组装
 │   ├── key/                    4 路按键：消抖、事件上报
 │   ├── pot/                    4 路电位器：ADC2 逐路采样、原始值/电压换算
+│   ├── serial/                 串口：双向环形缓冲、中断收发、printf 重定向
 │   └── tick/                   TIM1 1ms 系统节拍，供各模块挂载周期任务
 ├── driver/
 │   ├── common/error.h          统一错误码 error_t
 │   ├── bus/i2c/                软件模拟 I2C 总线
 │   └── device/ssd1306/         SSD1306 器件驱动 + 字库
-├── docs/                       模块实现详解（oled.md / key.md / pot.md）
+├── docs/                       模块实现详解（oled.md / key.md / pot.md / serial.md）
 ├── Drivers/
 │   ├── CMSIS/                  ARM CMSIS 内核与设备头文件（第三方，Apache-2.0）
 │   └── STM32F1xx_HAL_Driver/   ST HAL 驱动（第三方，BSD-3-Clause）
@@ -344,6 +355,89 @@ uint16_t bsp_pot_millivolt(pot_id_t id);     /* 0~3300 mV */
 
 若某个旋钮拧了没反应：先确认它是**三个脚都接好**（两端 3V3/GND、中间抽头接 ADC 引脚）。
 只接两端不接抽头、或 3V3 那端没接上，都会读数异常。
+
+---
+
+## 模块：串口（USART1）
+
+> **完整的实现原理讲解见 [docs/serial.md](docs/serial.md)** —— 从串口的时间预算讲到每一段并发代码在做什么，含这次踩过的全部坑。
+
+### 核心难点：接收必须中断，而中断里不能等
+
+115200 bps 下一帧 10 位，算下来**每个字节只隔约 87 µs**。
+而本工程主循环里挂着 OLED 整屏刷新（软件 I2C 写 1024 字节显存），耗时是**毫秒**量级——
+差两个数量级。所以：
+
+- **接收**：必须中断驱动，没有商量余地；靠轮询必然丢数据。
+- **发送**：做成中断驱动是为了**不阻塞主循环**。发 32 字节要 2.8 ms，
+  用轮询发送会让主循环停住这么久，按键不响应、电位器不采样。
+
+代价是 `bsp_serial_write()` 返回时数据**可能一个字节都还没发出去**。
+这是非阻塞的固有语义，不是 bug——需要「返回即已发完」时用 `bsp_serial_flush()`。
+
+### 环形缓冲为什么可以不加锁
+
+```
+发送：  主循环 ──写──> s_tx_head       中断 ──写──> s_tx_tail
+接收：  中断   ──写──> s_rx_head       主循环 ──写──> s_rx_tail
+```
+
+**每个索引都只有一个写者**（SPSC 模型），两个写者写的是不同变量，
+不存在「同时改一个变量」的竞态；而 Cortex-M3 对 16 位对齐变量的读写是单条指令。
+所以绝大部分代码**不需要关中断**——这正是它能做到非阻塞的基础。
+
+唯一需要关中断的是 `serial_tx_kick()`：它是 check-then-act，
+`s_tx_busy` 同时被发送中断改写，不保护会出现「两次 `HAL_UART_Transmit_IT` 并发」，
+窗口只有几条指令，**极难复现**。
+
+### 分层
+
+| 文件 | 职责 |
+| --- | --- |
+| [bsp/serial/bsp_serial.c](bsp/serial/bsp_serial.c) | 双向环形缓冲、中断回调、`printf` 重定向 |
+| [PID_Pendulum.ioc](PID_Pendulum.ioc) | USART1 的声明（异步、PA9/PA10、115200-8-N-1） |
+| `Core/Src/main.c` 生成部分 | `MX_USART1_UART_Init()` |
+| `Core/Src/stm32f1xx_hal_msp.c` | USART1 时钟使能、PA9/PA10 复用配置、NVIC |
+| `Core/Src/stm32f1xx_it.c` | `USART1_IRQHandler()` → `HAL_UART_IRQHandler()` |
+
+### API
+
+```c
+error_t  bsp_serial_init(void);                                  /* 武装接收中断 */
+uint32_t bsp_serial_write(const uint8_t *data, uint32_t len);    /* 非阻塞，返回实际写入数 */
+uint32_t bsp_serial_read(uint8_t *out, uint32_t max);            /* 非阻塞，有多少取多少 */
+uint32_t bsp_serial_rx_available(void);
+uint32_t bsp_serial_tx_free(void);
+uint32_t bsp_serial_rx_dropped(void);                            /* 诊断量，应恒为 0 */
+error_t  bsp_serial_flush(uint32_t timeout_ms);                  /* 唯一的阻塞函数 */
+```
+
+**为什么没有「读一行」接口**：串口是**字节流**，一次 `read` 可能只拿到半个报文，
+也可能拿到两条半。驱动不假装「一次调用 = 一条消息」，由上层处理这个事实。
+
+`printf` 也可以直接用（`_write()` 已重定向到发送缓冲）：
+
+```c
+printf("rp1=%u rp2=%u\r\n", bsp_pot_raw(POT_ID_RP1), bsp_pot_raw(POT_ID_RP2));
+```
+
+⚠️ 缓冲满时 printf 会**截断输出**（返回短计数），不会阻塞；`%f` 默认不可用
+（没开 `-u _printf_float`，开了多占约 6 KB Flash）；**绝不要在中断里调 printf**。
+
+### 烧录后串口应该收到什么
+
+```
+PID_Pendulum tick=1 rp1=1952 rp2=2276 rp3=1101 rp4=1746
+PID_Pendulum tick=2 rp1=1948 rp2=2279 rp3=1098 rp4=1743
+...
+```
+
+- **每 500 ms 一行**；`rp1~rp4` 跟着电位器变化，且**静止时轻微跳动**（真实 ADC 噪声）
+- **往串口发什么就收回什么**（回显）——用来验证接收链路
+- 用的是临时自检代码 `app_serial_service()`，在 [Core/Src/main.c](Core/Src/main.c) 里，验证完可整块删掉
+
+若收不到任何东西：先查 TX/RX 是否**交叉接线**、GND 是否共地、波特率是否 115200。
+若只能收到第一行之后就没有了，检查是否漏了回调里的 `HAL_UART_Receive_IT()` 重新武装。
 
 ---
 
