@@ -179,7 +179,9 @@ HAL        Drivers/           ST 的 HAL 与 CMSIS
 2. **可靠性**：STM32F103 的 I2C1 外设有已知 errata，总线异常时容易卡死。
 3. **学习价值**：位翻转把起止条件、应答位、时钟同步这些 I2C 核心机制摆在明面上。
 
-总线速度约 400 kHz，刷新一屏（1024 字节）约二十几毫秒，对显示用途完全够用。
+总线**目标**速率 400 kHz（[i2c_soft.h](driver/bus/i2c/i2c_soft.h) 的 `I2C_SOFT_DEFAULT_FREQ_HZ`）。
+软件模拟下实际频率会受 GPIO 翻转开销影响而偏离目标值，**本项目没有用示波器实测过**。
+刷新一屏（1024 字节）约 30 ms，对显示用途完全够用。
 
 **PB8/PB9 这两个引脚在 `.ioc` 里是有声明的**（`Signal=GPIO_Output`，模式开漏 + 上拉），由 CubeMX 生成到 `MX_GPIO_Init()`。声明的作用是**占位**：让 CubeMX 在配置阶段就知道这两个脚已被占用，以后加外设时不会静默抢走它们。
 
@@ -509,18 +511,33 @@ exit                                      # 漏了这行 CubeMX 会挂住不退�
 > 想确认某个命令的语法，可以写个只有 `help`（或 `set`、`get`）的脚本跑一遍，CubeMX 会把用法打出来——比搜网页权威。
 > `get modes <外设>` 能列出该外设所有可选模式名，**别猜名字**。
 
-### 改完必须验证
+### 改完必须验证（三步，缺一不可）
 
-无论走哪条路径，改完 `.ioc` 后都要让 CubeMX 做一次「加载 → 另存」往返，看有没有键被丢弃或改写：
+无论走哪条路径，改完 `.ioc` 后都要做这三步：
+
+**① 往返（load → save）** —— 看有没有键被丢弃或改写：
 
 ```bash
-# 借助 stm32-hal-modify skill 的脚本（或 stm32-hal-init 的 roundtrip）
-python <skills>/stm32-hal-modify/scripts/cubemx_cfg.py roundtrip "<工程目录>"
+# stm32-cubemx skill 的脚本（工程目录和 .ioc 路径都收）
+python <skills>/stm32-cubemx/scripts/cubemx.py roundtrip "<工程目录>"
 ```
 
 看到 `OK: 写的参数全部被 CubeMX 原样保留了` 才算参数被接受。
 
-**注意「参数被接受」≠「代码被生成」**——还要去生成的 `.c` 里逐项找到对应代码（`MX_xxx_Init()`、`HAL_NVIC_EnableIRQ()`、`GPIO_InitStruct.Mode`）。这套工具链最典型的失败模式就是：所有命令都返回成功，硬件毫无反应。
+**② 看 CubeMX 日志里有没有 `invalid value`**
+
+这一步 **`roundtrip` 替代不了**：它比的是「键在不在、有没有被改写」，**比不出「值合不合法」**——CubeMX 对不认识的取值照样原样存进 `.ioc`。能说明问题的只有日志原话（`roundtrip` 会自动把这几行打出来，也可以自己看 `~/.stm32cubemx/STM32CubeMX.log`，每次运行覆盖写）：
+
+```
+IP not ready for code generation: USART1
+Parameter (WordLength) has invalid value (UART_WORDLENGTH_8B)
+```
+
+出现这个就说明**那个外设的取值写错了**：它会进入 not-ready 状态，生成的 `MX_xxx_Init()` 会**少字段**。而零初始化后常常碰巧还是对的——于是错误被彻底掩盖，直到有人要改校验位才会炸。
+
+**③ 去生成的 `.c` 里逐项找到对应代码** —— `MX_xxx_Init()`、`HAL_NVIC_EnableIRQ()`、`GPIO_InitStruct.Mode`，特别是**数一数字段够不够**（少了就是第②步没做到位）。
+
+> ⚠️ **「参数被接受」≠「取值合法」≠「代码被生成」**——这三件事各自独立，而且失败时的表现都是「所有命令返回成功、硬件毫无反应」。只要有一道检查是「通过即放行」，就要再找一条独立通道去证伪。
 
 ### CubeMX 重新生成时，什么会保留
 
