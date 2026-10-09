@@ -469,6 +469,16 @@ static void cmd_stat(void)
     resp_str(&r, " POUT=");     resp_f3(&r, st.pos_out);
     resp_str(&r, " PWM=");      resp_i32(&r, (int32_t)st.pwm);
     resp_str(&r, " RUN=");      resp_u32(&r, (st.state == CONTROL_STATE_RUN) ? 1U : 0U);
+    /*
+     * ST 是「总状态」（0 停 / 1 双环 / 2 启摆），RUN 是「双环在不在跑」。
+     * 两个都给是有意的：启摆期间 RUN=0 而 ST=2，**光看 RUN 分不出
+     * 「停着」和「正在启摆」**，而 agent 对这两种情况的反应完全不同。
+     *
+     * SWR 是上一次启摆的结局（0 没启摆过 / 1 成功 / 2 超时 / 3 被打断）。
+     * 同样是"停着"，超时停和被按停要分开。
+     */
+    resp_str(&r, " ST=");       resp_u32(&r, (uint32_t)st.state);
+    resp_str(&r, " SWR=");      resp_u32(&r, (uint32_t)st.swing_result);
     resp_send(&r);
 }
 
@@ -489,6 +499,30 @@ static void cmd_run(void)
         resp_str(&r, "ERR NOT_INITIALIZED");
     }
 
+    resp_send(&r);
+}
+
+static void cmd_swing(void)
+{
+    resp_t          r;
+    control_status_t st;
+    const error_t   e = control_swing_up();
+
+    resp_reset(&r);
+
+    if (e != ERR_OK) {
+        resp_str(&r, "ERR NOT_INITIALIZED");
+        resp_send(&r);
+        return;
+    }
+
+    /* 把结果状态回给 agent：
+     *   ST=1 → 角度本来就在启动窗口内，直接进了双环（没启摆）
+     *   ST=2 → 正在启摆，摆杆荡进窗口后会自动转成 ST=1
+     * 两者后续该做的事不同，所以要分得开。 */
+    control_get_status(&st);
+    resp_str(&r, "OK ST=");
+    resp_u32(&r, (uint32_t)st.state);
     resp_send(&r);
 }
 
@@ -576,7 +610,7 @@ static void cmd_help(void)
      */
     resp_reset(&r);
     resp_str(&r, "OK CMD=");
-    resp_str(&r, "SET,GET,STAT,RUN,STOP,ZERO,TARGET,STREAM,HELP");
+    resp_str(&r, "SET,GET,STAT,RUN,SWING,STOP,ZERO,TARGET,STREAM,HELP");
     resp_str(&r, " PARAM=");
     for (int i = 0; i < (int)CONTROL_PARAM_COUNT; i++) {
         if (i > 0) {
@@ -621,6 +655,8 @@ static void console_execute(void)
         cmd_stat();
     } else if (strcmp(tok[0], "RUN") == 0) {
         cmd_run();
+    } else if (strcmp(tok[0], "SWING") == 0) {
+        cmd_swing();
     } else if (strcmp(tok[0], "STOP") == 0) {
         cmd_stop();
     } else if (strcmp(tok[0], "ZERO") == 0) {

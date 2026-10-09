@@ -402,10 +402,16 @@ static void oled_redraw(void)
   ssd1306_fill(&s_oled, SSD1306_BLACK);
 
   /* 标题 + 运行状态。
-   * 状态直接问 control 模块，不在 main 里另存一份 —— 见 PV 段的说明。 */
+   * 状态直接问 control 模块，不在 main 里另存一份 —— 见 PV 段的说明。
+   *
+   * 三态：STOP / RUN / SWG（自动启摆中）。这里**不能再用
+   * control_is_running()** —— 它问的是"双环在不在跑"，启摆期间返回 false，
+   * 屏上就会显示成 STOP，看着像没启动。用快照里的 state 才准。 */
   (void)ssd1306_set_cursor(&s_oled, 0U, OLED_LINE_TITLE_Y);
   (void)ssd1306_write_string(&s_oled, "Pendulum", &Font_7x10, SSD1306_WHITE);
-  oled_text(OLED_STATE_X, OLED_LINE_TITLE_Y, control_is_running() ? "RUN" : "STOP");
+  oled_text(OLED_STATE_X, OLED_LINE_TITLE_Y,
+            (st.state == CONTROL_STATE_RUN)      ? "RUN" :
+            (st.state == CONTROL_STATE_SWING_UP) ? "SWG" : "STOP");
 
   const uint16_t x0  = OLED_COL0_X;
   const uint16_t x1  = OLED_COL1_X;
@@ -468,7 +474,7 @@ static void app_pos_target_step(int32_t delta)
   * @brief  处理按键事件。
   *
   * 按键分工（**改成了官方那套语义**）：
-  *   K1 —— 启动 / 停止控制
+  *   K1 —— 启动 / 停止控制（启动时若摆杆不在竖直附近，会自动启摆）
   *   K2 —— 位置目标 +408（横杆正转一圈）
   *   K3 —— 位置目标 −408（横杆反转一圈）
   *   K4 —— 位置清零（位置计数与目标一起归零）并停机
@@ -493,13 +499,27 @@ static void app_handle_keys(void)
 
       switch ((key_id_t)i) {
         case KEY_ID_K1:
-          /* 角度不在中心窗口内时 control_start() 会拒绝启动 ——
-           * 这是有意的，见 control.h 的盲区陷阱说明。
-           * 按 K1 没反应时先看屏幕上的 Ang：多半是摆杆没扶到竖直附近。 */
-          if (control_is_running()) {
-            (void)control_stop();
-          } else {
-            (void)control_start();
+          /* 非停止态（双环运行中 或 正在启摆）→ 停；停止态 → 启动。
+           *
+           * 启动用 control_swing_up() 而不是 control_start()：
+           *   · 摆杆已经在竖直附近 → 它内部直接转成双环控制，行为与旧的
+           *     K1 完全一样（扶着摆杆按 K1 的用法没变）；
+           *   · 摆杆垂着 → 它自己去荡摆杆。以前这种情况是**静默失败**
+           *     （control_start 返回 ERR_NOT_READY，屏幕上什么都不变），
+           *     现在会自己荡起来。
+           *
+           * ⚠️ 判"停"必须连启摆一起算。`control_is_running()` 在启摆期间
+           *    返回 false，只用它的话，**启摆中再按一次 K1 会变成"重新启摆"**
+           *    而不是停止。所以这里看总状态 state。 */
+          {
+            control_status_t st;
+            control_get_status(&st);
+
+            if (st.state != CONTROL_STATE_STOP) {
+              (void)control_stop();
+            } else {
+              (void)control_swing_up();
+            }
           }
           break;
 

@@ -131,6 +131,62 @@
  */
 #define CONTROL_DEFAULT_START       (150U)
 
+/*
+ * ── 自动启摆（swing-up）的三组参数 ────────────────────────────────
+ *
+ * 算法与下面几个默认值都取自参考工程 `16-倒立摆-自动启摆` 的 1 ms 状态机
+ * （状态 1 判定 / 21~24 与 31~34 两组脉冲 / 4 双环）。完整说明见 control.h。
+ * ────────────────────────────────────────────────────────────────
+ */
+
+/**
+ * 启摆脉冲占空比（PWM 码）。默认 630 = **参考的 35% × 18**。
+ *
+ * 参考的 `START_PWM = 35`，而它的 PWM 时基是 ARR=99（满量程 100），
+ * 所以那是 **35% 占空比**；本工程满量程 1800，35% × 1800 = 630。
+ * 与增益、OFFSET 用的是同一条 ×18 换算规则。
+ *
+ * ⚠️ 参考注释原文：「此值需要根据自己的设备对应更改，一般在 30~40 之间；
+ *    力度太小摆杆始终摆不上去，力度太大摆杆经常摆过头」。
+ *    所以它是**逐台标定量**，做成了可在线改的参数（`SET SWP`）。
+ */
+#define CONTROL_DEFAULT_SWP         (630.0f)    /* 35 × 18 */
+
+/**
+ * 启摆脉冲宽度（毫秒）。默认 100，对应参考的 `START_TIME = 100`。
+ *
+ * ⚠️ 参考注释：「太小则力度发不出来，太大则不利于共振启摆，一般 80~120」。
+ */
+#define CONTROL_DEFAULT_SWT         (100.0f)
+
+/**
+ * 判定相的采样间隔（毫秒）。对齐参考实现的 40 ms。
+ *
+ * 判定要连取 3 个点、看"中间点是不是极值"。间隔太小会被 ADC 噪声骗到；
+ * 太大则要等摆幅已经很大才认得出顶点，白白少注能量。
+ */
+#define CONTROL_SWING_JUDGE_MS      (40U)
+
+/**
+ * 交棒判定要在 `START` 窗口内**连续**满足多少毫秒（见 swing_tick()）。
+ *
+ * 用「连续 N 毫秒」而不是「连续两次采样」：判定点每 40 ms 才有一个，
+ * 而摆杆从竖直附近掠过时可能一次采样都落不进 `START`（±150）这个窄窗口，
+ * 那就永远等不到交棒。改成每 1 ms 查一次、连续 5 ms 满足才认 ——
+ * 既抓得住快掠，又不会被 ADC 的 ±8 码噪声骗到。
+ */
+#define CONTROL_SWING_CATCH_MS      (5U)
+
+/**
+ * 启摆超时（毫秒）。**这一条是本工程加的，参考实现没有。**
+ *
+ * 参考的状态机会一直泵能量、直到摆杆进窗口为止。无人看管时这不行：
+ * 万一方向符号反了、或者 SWP 标定得不对，电机会以 35% 占空比无限冲击下去。
+ * 30 秒对正常启摆是足够的（参考实测量级是几秒），到点就停机，
+ * 并在 `swing_result` 里记成 `CONTROL_SWING_TIMEOUT`。
+ */
+#define CONTROL_SWING_TIMEOUT_MS    (30000U)
+
 /* ----------------------------------------------------------------- 状态 */
 
 static bool             s_initialized = false;
@@ -144,6 +200,30 @@ static pid_t s_pos_pid;         /* 外环：位置 */
 static int32_t s_pos_target   = 0;      /* 位置环目标，单独存（int32 语义）*/
 static uint8_t s_count_angle  = 0U;     /* 角度环分频计数 */
 static uint8_t s_count_pos    = 0U;     /* 位置环分频计数 */
+
+/* —— 自动启摆的子状态 ——
+ *
+ * 与参考实现的状态编号对应关系：
+ *   SWING_PULSE1 / PULSE1_WAIT  ←→  21 / 22（或 31 / 32）
+ *   SWING_PULSE2 / PULSE2_WAIT  ←→  23 / 24（或 33 / 34）
+ *   SWING_JUDGE                 ←→  1
+ */
+typedef enum {
+    SWING_JUDGE = 0,        /**< 判定相：等摆杆到顶点，或等它进窗口 */
+    SWING_PULSE1,           /**< 打第一个脉冲 */
+    SWING_PULSE1_WAIT,      /**< 第一个脉冲计时中 */
+    SWING_PULSE2,           /**< 打第二个脉冲（方向与第一个相反）*/
+    SWING_PULSE2_WAIT,      /**< 第二个脉冲计时中 */
+} swing_phase_t;
+
+static swing_phase_t s_swing_phase   = SWING_JUDGE;
+static int8_t        s_swing_dir     = 1;    /* 第一个脉冲的方向；+1 对应参考的 21 */
+static uint16_t      s_swing_timer   = 0U;   /* 脉冲倒计时，毫秒 */
+static uint32_t      s_swing_elapsed = 0U;   /* 已启摆时间，毫秒（超时用）*/
+static uint8_t       s_count_judge   = 0U;   /* 判定采样分频计数 */
+static uint8_t       s_ang_count     = 0U;   /* 已攒够几个判定采样（不足 3 个不判定）*/
+static uint8_t       s_swing_hits    = 0U;   /* 连续几个毫秒落在 START 窗口内（交棒用）*/
+static uint16_t      s_ang[3]        = {0U, 0U, 0U};  /* 连续三次判定采样，[0] 最新 */
 
 /* ----------------------------------------------------------------- 内部 */
 
@@ -188,6 +268,227 @@ static void apply_motor(float angle_out)
     s_status.pwm = duty;
 }
 
+/* ----------------------------------------------------------------- 启摆 */
+
+/**
+ * @brief 按方向打一个启摆脉冲，并同步快照。
+ *
+ * 启摆**不叠静摩擦补偿**（不走 apply_motor）：脉冲本身就是"用力推一下"，
+ * 再叠一个 offset 只会让标定多一个变量。
+ */
+static void swing_pulse(int8_t sign)
+{
+    const int16_t duty = (int16_t)((sign > 0) ? s_params.swing_pwm
+                                              : -s_params.swing_pwm);
+
+    (void)bsp_motor_set_duty(duty);
+    s_status.pwm = duty;
+}
+
+/**
+ * @brief 启摆完成：交棒给双环 PID。
+ *
+ * ⚠️ **这里不走 `control_start()`**，直接搭 RUN 状态。两个理由：
+ *
+ *   ① 交棒判定（swing_tick 里）用的就是 `start_range`，与 `control_start()`
+ *      的准入条件**完全一样**，再查一遍是白做。
+ *   ② 角度是**活的**：查完到调用之间它还会动。万一这一瞬间漂出窗口，
+ *      `control_start()` 会返回 ERR_NOT_READY —— 于是"交棒"变成了"停机"，
+ *      现象是「明明快成了却突然停下」，而且下一轮还会再演一遍。
+ */
+static void swing_finish(void)
+{
+    /*
+     * 位置清零：对齐参考实现（它进 PID 时做 `Location = 0`）。
+     * 启摆过程中横杆转到哪里是不确定的，把当前位置当成新的原点，位置环
+     * 才有意义；否则位置误差一上来就是个几百上千码的台阶。
+     */
+    (void)bsp_encoder_reset();
+    s_pos_target = 0;
+
+    pid_reset(&s_angle_pid);
+    pid_reset(&s_pos_pid);
+
+    s_angle_pid.actual = (float)s_status.angle;
+    s_angle_pid.target = (float)s_params.center_angle;
+    s_pos_pid.actual   = 0.0f;
+    s_pos_pid.target   = 0.0f;
+
+    s_status.position = 0;
+    s_status.angle_target = (float)s_params.center_angle;
+    s_status.angle_out    = 0.0f;
+    s_status.pos_out      = 0.0f;
+
+    s_count_angle = 0U;
+    s_count_pos   = 0U;
+
+    s_state = CONTROL_STATE_RUN;
+    /* 快照也要立刻跟上：否则紧接着的一次 STAT / 串口命令会读到上一拍的
+     * 旧状态（control_tick 要等下一个 1 ms 才刷新它）。 */
+    s_status.state        = CONTROL_STATE_RUN;
+    s_status.swing_result = (uint8_t)CONTROL_SWING_OK;
+}
+
+/**
+ * @brief 启摆判定相：每 CONTROL_SWING_JUDGE_MS 采一个点，看摆杆到顶点没有、
+ *        或者已经进窗口了没有。
+ *
+ * 三个判定条件**逐字照抄参考实现**（它的状态 1），只把 CENTER / RANGE
+ * 换成可在线改的参数。三个条件天然互斥：顶点判定要求三个点都在窗口**外**，
+ * 进窗口判定要求两个点都在窗口**内**。
+ *
+ * @note 本实现比参考多一个 `s_ang_count`：每组脉冲打完之后，要**重新攒够
+ *       3 个新鲜采样**才开始判定。参考那边 `Angle0/1/2` 是函数静态变量，
+ *       回到状态 1 时不复位，所以它第一次判定会掺进脉冲之前的旧值——
+ *       那是可能误判出"顶点"的。多攒 120 ms 只让每轮慢一点点，却把这一类
+ *       误判整个去掉了。
+ */
+static void swing_judge(void)
+{
+    const int32_t c = (int32_t)s_params.center_angle;
+    const int32_t r = (int32_t)s_params.center_range;
+
+    s_count_judge++;
+    if (s_count_judge < (uint8_t)CONTROL_SWING_JUDGE_MS) {
+        return;
+    }
+    s_count_judge = 0U;
+
+    /* 采样入队：[0] 最新，[2] 最旧 */
+    s_ang[2] = s_ang[1];
+    s_ang[1] = s_ang[0];
+    s_ang[0] = s_status.angle;
+
+    if (s_ang_count < 3U) {
+        s_ang_count++;
+        return;                         /* 还没攒够，不判定 */
+    }
+
+    const int32_t a0 = (int32_t)s_ang[0];
+    const int32_t a1 = (int32_t)s_ang[1];
+    const int32_t a2 = (int32_t)s_ang[2];
+
+    /* —— 右侧顶点：三点都在右侧区间，且中间点是极小值 ——
+     * 「中间点是极值」等价于「摆杆在这里掉头」，也就是摆动的顶点。 */
+    if ((a0 > (c + r)) && (a1 > (c + r)) && (a2 > (c + r)) &&
+        (a1 < a0) && (a1 < a2)) {
+        s_swing_dir   = 1;              /* 对应参考的状态 21：先正向再反向 */
+        s_swing_phase = SWING_PULSE1;
+        return;
+    }
+
+    /* —— 左侧顶点：镜像 —— */
+    if ((a0 < (c - r)) && (a1 < (c - r)) && (a2 < (c - r)) &&
+        (a1 > a0) && (a1 > a2)) {
+        s_swing_dir   = -1;             /* 对应参考的状态 31：先反向再正向 */
+        s_swing_phase = SWING_PULSE1;
+        return;
+    }
+
+    /*
+     * ⚠️ 「进窗口就交棒」这一条**不在这里**，而是在 swing_tick() 里每 1 ms 查。
+     *    两个原因，都不是风格问题：
+     *
+     *     ① **窗口必须用 START（±150），不能用 RANGE（±500）。** 参考实现
+     *        用的是 CENTER_RANGE，但本台实测「摆杆自由下垂」读数是 1883，
+     *        而 CENTER ± 500 = [1586, 2586] —— **1883 正好落在里面**。
+     *        照搬的结果是：启摆刚开始判定就把垂着的摆杆判成"进窗口了"，
+     *        直接交给双环 PID（还是默认增益），电机立刻猛冲。这个坑在
+     *        control.h 的盲区一节早就写过，移植时却差点原样踩进去。
+     *
+     *     ② 判定点每 40 ms 才一个，而摆杆从竖直附近掠过时可能一个点都
+     *        落不进 ±150 的窄窗口，那就永远等不到交棒。
+     */
+}
+
+/**
+ * @brief 启摆状态机的 1 ms 推进。由 control_tick() 在 SWING_UP 状态下调用。
+ *
+ * 对应参考的 21~24 / 31~34 四步一组：打一个方向的脉冲 → 计时 →
+ * 打反方向的脉冲 → 计时 → 回判定相。
+ *
+ * ⚠️ **两个脉冲首尾相接、中间不留空隙**，这与参考一致。改成"打一下停一下"
+ *    会改变注进摆杆的能量，得不偿失。
+ */
+static void swing_tick(void)
+{
+    /* —— 超时兜底（参考实现没有这一条，见 CONTROL_SWING_TIMEOUT_MS）—— */
+    s_swing_elapsed++;
+    if (s_swing_elapsed > CONTROL_SWING_TIMEOUT_MS) {
+        /* control_stop() 会把结局记成 ABORTED（那是给"人按停"用的），
+         * 所以调完再盖回 TIMEOUT，否则串口上分不出是谁停的。 */
+        (void)control_stop();
+        s_status.swing_result = (uint8_t)CONTROL_SWING_TIMEOUT;
+        return;
+    }
+
+    /*
+     * ── 交棒判定：每 1 ms 查一次，窗口用 START（±150）──
+     *
+     * 用 START 而不是 RANGE 是**必须的**，理由见 swing_judge() 的注释：
+     * 本台实测自由下垂读数 1883 落在 CENTER±500 内，用 RANGE 会把垂着的
+     * 摆杆判成"已经立好了"，直接交棒给默认增益的双环、电机立刻猛冲
+     * （2026-10-09 实测踩到过：SWP=0 的一次自检里臂真的动了）。
+     *
+     * 用 START 也顺带把语义统一了：**交棒条件 == RUN 的准入条件**。
+     * 启摆的任务就是"把摆杆弄到 RUN 会接受的状态"，两个窗口在这里合流。
+     */
+    if (angle_in_window(s_status.angle, s_params.start_range)) {
+        s_swing_hits++;
+        if (s_swing_hits >= (uint8_t)CONTROL_SWING_CATCH_MS) {
+            swing_finish();
+            return;
+        }
+    } else {
+        s_swing_hits = 0U;
+    }
+
+    const uint16_t swt = (uint16_t)s_params.swing_time;
+
+    switch (s_swing_phase) {
+        case SWING_PULSE1:
+            swing_pulse(s_swing_dir);
+            s_swing_timer = swt;
+            s_swing_phase = SWING_PULSE1_WAIT;
+            break;
+
+        case SWING_PULSE1_WAIT:
+            if (s_swing_timer > 0U) {
+                s_swing_timer--;
+            }
+            if (s_swing_timer == 0U) {
+                s_swing_phase = SWING_PULSE2;
+            }
+            break;
+
+        case SWING_PULSE2:
+            swing_pulse((int8_t)(-s_swing_dir));
+            s_swing_timer = swt;
+            s_swing_phase = SWING_PULSE2_WAIT;
+            break;
+
+        case SWING_PULSE2_WAIT:
+            if (s_swing_timer > 0U) {
+                s_swing_timer--;
+            }
+            if (s_swing_timer == 0U) {
+                /* 这一组打完：滑行，回判定相，重新攒三个点。
+                 * 用 coast 而不是 set_duty(0)——脉冲间隙要让摆杆自由摆动。 */
+                (void)bsp_motor_coast();
+                s_status.pwm  = 0;
+                s_count_judge = 0U;
+                s_ang_count   = 0U;
+                s_swing_phase = SWING_JUDGE;
+            }
+            break;
+
+        case SWING_JUDGE:
+        default:
+            swing_judge();
+            break;
+    }
+}
+
 /* ----------------------------------------------------------------- 实现 */
 
 error_t control_init(void)
@@ -202,6 +503,8 @@ error_t control_init(void)
     s_params.p_ki = CONTROL_DEFAULT_PKI;
     s_params.p_kd = CONTROL_DEFAULT_PKD;
     s_params.pwm_offset   = CONTROL_DEFAULT_OFFSET;
+    s_params.swing_pwm    = CONTROL_DEFAULT_SWP;
+    s_params.swing_time   = CONTROL_DEFAULT_SWT;
     s_params.center_angle = CONTROL_DEFAULT_CENTER;
     s_params.center_range = CONTROL_DEFAULT_RANGE;
     s_params.start_range  = CONTROL_DEFAULT_START;
@@ -241,6 +544,7 @@ error_t control_init(void)
     s_status.pos_out       = 0.0f;
     s_status.pwm           = 0;
     s_status.state         = CONTROL_STATE_STOP;
+    s_status.swing_result  = (uint8_t)CONTROL_SWING_NONE;
 
     s_angle_pid.actual = (float)s_status.angle;
     s_pos_pid.actual   = (float)s_status.position;
@@ -248,6 +552,18 @@ error_t control_init(void)
     s_count_angle = 0U;
     s_count_pos   = 0U;
     s_state       = CONTROL_STATE_STOP;
+
+    /* 启摆子状态也一并复位，免得第一次 SWING 用上一次的残留相位 */
+    s_swing_phase   = SWING_JUDGE;
+    s_swing_dir     = 1;
+    s_swing_timer   = 0U;
+    s_swing_elapsed = 0U;
+    s_count_judge   = 0U;
+    s_ang_count     = 0U;
+    s_swing_hits    = 0U;
+    s_ang[0] = 0U;
+    s_ang[1] = 0U;
+    s_ang[2] = 0U;
 
     /* 未启动时保证电机不动。上电时序里 motor_init 已经把占空比清过，
      * 这里是双保险，也顺便覆盖「控制模块比电机晚初始化」的情况。 */
@@ -299,8 +615,13 @@ void control_tick(void)
      *
      * 每拍都写一次 coast，而不是「停机时写一次就完了」。理由：
      * 停机之后万一有别的地方动过电机（调试时很常见），下一拍就会被
-     * 拉回来。开销是几个寄存器写，可以忽略。 */
-    if (s_state != CONTROL_STATE_RUN) {
+     * 拉回来。开销是几个寄存器写，可以忽略。
+     *
+     * ⚠️ 这里的判断**必须是 `== STOP`，不能写成 `!= RUN`**。加了启摆状态
+     *    之后，「不是 RUN」把 SWING_UP 也包了进去；写成 `!= RUN` 会把启摆
+     *    当成停止态、每拍强制 coast 后 return —— 现象是「发 SWING 之后
+     *    完全没反应、电机一动不动」，而且**不报任何错**。 */
+    if (s_state == CONTROL_STATE_STOP) {
         (void)bsp_motor_coast();
         s_status.pwm   = 0;
         s_status.state = CONTROL_STATE_STOP;
@@ -316,6 +637,16 @@ void control_tick(void)
         return;
     }
     s_status.state = s_state;
+
+    /* ── ④b 自动启摆 ─────────────────────────────────────────────
+     *
+     * 启摆期间两个 PID 环都不算：这是「把摆杆荡上去」的阶段，摆杆本来就
+     * 是倒的，做闭环没有意义。倒下保护（③）也只在 RUN 生效，所以这里
+     * 不会被自己的保护逻辑打断。 */
+    if (s_state == CONTROL_STATE_SWING_UP) {
+        swing_tick();
+        return;
+    }
 
     /* ── ⑤ 角度环（内环，5 ms）───────────────────────────────────
      *
@@ -392,6 +723,8 @@ error_t control_start(void)
     s_count_angle = 0U;
     s_count_pos   = 0U;
     s_state       = CONTROL_STATE_RUN;
+    /* 快照立刻跟上：否则 RUN 命令之后紧接的一条 STAT 会读到上一拍的旧状态 */
+    s_status.state = CONTROL_STATE_RUN;
 
     s_status.pos_out      = 0.0f;
     s_status.angle_target = s_angle_pid.target;
@@ -399,9 +732,76 @@ error_t control_start(void)
     return ERR_OK;
 }
 
+error_t control_swing_up(void)
+{
+    if (!s_initialized) {
+        return ERR_NOT_INITIALIZED;
+    }
+
+    /* 已经在双环控制中：什么都不做（幂等），不要把正在稳住的摆杆打断 */
+    if (s_state == CONTROL_STATE_RUN) {
+        return ERR_OK;
+    }
+
+    /*
+     * 角度已经在启动窗口内 → 不必荡，直接交给 control_start()。
+     * 这样「扶着摆杆按 K1」的旧用法行为完全不变。
+     */
+    if (angle_in_window(s_status.angle, s_params.start_range)) {
+        return control_start();
+    }
+
+    /*
+     * 开始启摆。第一组脉冲对应参考实现的状态 21（先正向、再反向），
+     * 这不是随便定的：摆杆此刻多半垂在盲区里、读数无效，先用一记脉冲
+     * 把它踢出盲区，后面的顶点判定才成立。参考的注释也是这个意思
+     * （「使摆杆离开角度传感器盲区，避免盲区干扰」）。
+     */
+    s_swing_phase   = SWING_PULSE1;
+    s_swing_dir     = 1;
+    s_swing_timer   = 0U;
+    s_swing_elapsed = 0U;
+    s_count_judge   = 0U;
+    s_ang_count     = 0U;
+    s_swing_hits    = 0U;
+    s_ang[0] = 0U;
+    s_ang[1] = 0U;
+    s_ang[2] = 0U;
+
+    s_status.swing_result = (uint8_t)CONTROL_SWING_NONE;
+    s_status.angle_target = (float)s_params.center_angle;
+    s_status.angle_out    = 0.0f;
+    s_status.pos_out      = 0.0f;
+
+    s_state = CONTROL_STATE_SWING_UP;
+    /* 快照立刻跟上，否则 SWING 命令回的那条 ST= 会读到上一拍的旧状态 */
+    s_status.state = CONTROL_STATE_SWING_UP;
+
+    return ERR_OK;
+}
+
 error_t control_stop(void)
 {
+    /*
+     * 如果这次停机打断的是一次启摆，把结局记成 ABORTED。
+     * 串口上要能分出「人（或 agent）按停的」和「启摆超时自己停的」——
+     * 这两种情况下一步该做的事完全不同。
+     */
+    if (s_state == CONTROL_STATE_SWING_UP) {
+        s_status.swing_result = (uint8_t)CONTROL_SWING_ABORTED;
+    }
+
     s_state = CONTROL_STATE_STOP;
+
+    /* 启摆子状态一并复位：下次 SWING 从"打第一组脉冲"重新开始，
+     * 不会带着上一次的相位/计时继续跑。 */
+    s_swing_phase   = SWING_JUDGE;
+    s_swing_dir     = 1;
+    s_swing_timer   = 0U;
+    s_swing_elapsed = 0U;
+    s_count_judge   = 0U;
+    s_ang_count     = 0U;
+    s_swing_hits    = 0U;
 
     /*
      * 把两个环的输出清掉，但**保留** angle / position（那两个是实测值，
@@ -416,6 +816,8 @@ error_t control_stop(void)
     s_status.pos_out      = 0.0f;
     s_status.angle_target = (float)s_params.center_angle;
     s_status.pwm          = 0;
+    /* 快照立刻跟上：否则紧接着的一条 STAT 会读到上一拍的旧状态 */
+    s_status.state        = CONTROL_STATE_STOP;
 
     /* 停机 = 滑行，不是刹车。倒立摆停机时摆杆是自由摆动的，
      * 用刹车会让横杆急停、摆杆被惯性甩得更凶。 */
@@ -585,6 +987,26 @@ error_t control_param_set(control_param_t p, float value)
             s_params.pwm_offset = value;
             break;
 
+        case CONTROL_PARAM_SWP:
+            /* 与 OFFSET 同一条约束：脉冲方向由状态机决定，负值没有意义。
+             * **允许 0** —— 那是「只判定、不打脉冲」，调试状态机时有用，
+             * 而且此时电机保证不动（脉冲占空比为 0）。 */
+            if (value < 0.0f || value >= (float)BSP_MOTOR_DUTY_MAX) {
+                return ERR_INVALID_PARAM;
+            }
+            s_params.swing_pwm = value;
+            break;
+
+        case CONTROL_PARAM_SWT:
+            /* 下限 1：0 毫秒的脉冲等于没打，只会让状态机空转。
+             * 上限 1000：参考的推荐区间是 80~120；超过 1 秒已经不是
+             * 「一次瞬时冲击」而是持续驱动了，拦住它。 */
+            if (value < 1.0f || value > 1000.0f) {
+                return ERR_INVALID_PARAM;
+            }
+            s_params.swing_time = value;
+            break;
+
         default:
             return ERR_INVALID_PARAM;
     }
@@ -605,6 +1027,8 @@ float control_param_get(control_param_t p)
         case CONTROL_PARAM_RANGE:  return (float)s_params.center_range;
         case CONTROL_PARAM_START:  return (float)s_params.start_range;
         case CONTROL_PARAM_OFFSET: return s_params.pwm_offset;
+        case CONTROL_PARAM_SWP:    return s_params.swing_pwm;
+        case CONTROL_PARAM_SWT:    return s_params.swing_time;
         default:                   return 0.0f;
     }
 }
@@ -613,7 +1037,7 @@ const char *control_param_name(control_param_t p)
 {
     static const char *const names[CONTROL_PARAM_COUNT] = {
         "AKP", "AKI", "AKD", "PKP", "PKI", "PKD",
-        "CENTER", "RANGE", "START", "OFFSET",
+        "CENTER", "RANGE", "START", "OFFSET", "SWP", "SWT",
     };
 
     if ((int)p < 0 || p >= CONTROL_PARAM_COUNT) {

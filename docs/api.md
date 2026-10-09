@@ -708,10 +708,11 @@ TIM3 编码器模式，AB 正交**四倍频**。**408 边沿 / 输出轴圈**。
 | 名称 | 值 | 说明 |
 | --- | --- | --- |
 | `CONTROL_POS_TARGET_LIMIT` | 4080 | 位置目标绝对值上限（408 边沿 = 横杆一圈，正反各 10 圈） |
-| `control_state_t` | `CONTROL_STATE_STOP` / `CONTROL_STATE_RUN` | 用枚举而非 bool，是为以后插自动启摆留扩展位 |
-| `control_param_t` | `AKP AKI AKD PKP PKI PKD CENTER RANGE START OFFSET` + `CONTROL_PARAM_COUNT` | 可在线改的参数编号 |
+| `control_state_t` | `CONTROL_STATE_STOP` / `CONTROL_STATE_RUN` / `CONTROL_STATE_SWING_UP` | 0 停 / 1 双环 PID / 2 自动启摆中 |
+| `control_param_t` | `AKP AKI AKD PKP PKI PKD CENTER RANGE START OFFSET SWP SWT` + `CONTROL_PARAM_COUNT` | 可在线改的参数编号（共 12 个） |
 | `control_params_t` | — | 参数集合。**只读**，改参数请走 `control_param_set()` |
-| `control_status_t` | — | 一次取齐的状态快照（角度/位置/速度/两环目标与输出/PWM/状态） |
+| `control_status_t` | — | 一次取齐的状态快照（角度/位置/速度/两环目标与输出/PWM/状态/启摆结局）|
+| `control_swing_result_t` | `NONE` / `OK` / `TIMEOUT` / `ABORTED` | 上一次启摆的结局，给串口分「超时停」和「被按停」用 |
 
 **接口**
 
@@ -719,7 +720,8 @@ TIM3 编码器模式，AB 正交**四倍频**。**408 边沿 / 输出轴圈**。
 | --- | --- | --- |
 | 初始化 | `error_t control_init(void)` | 载默认参数、对齐快照、把电机置滑行。**初始状态是 STOP**；要在电机/编码器/角度三个驱动之后调 |
 | 1 ms 任务 | `void control_tick(void)` | **挂在节拍上，中断上下文**。取角度、推进编码器、倒下保护、分频出 5 ms / 50 ms 两环 |
-| 启动 | `error_t control_start(void)` | 角度不在 `CENTER ± START` 内返回 `ERR_NOT_READY`；会清两个环的积分与历史误差 |
+| 启动 | `error_t control_start(void)` | **严格**：角度不在 `CENTER ± START` 内返回 `ERR_NOT_READY`；会清两个环的积分与历史误差 |
+| 启动（自动）| `error_t control_swing_up(void)` | 角度已在窗口内 → 等价于 `control_start()`；否则 → 进 `CONTROL_STATE_SWING_UP` 自动启摆。已在 RUN 时幂等返回 |
 | 停止 | `error_t control_stop(void)` | 电机**滑行**（不是刹车）；倒下保护内部也走它 |
 | 是否运行 | `bool control_is_running(void)` | 唯一的「运行状态」真相，别在别处再存一份 |
 | 位置清零 | `error_t control_zero_position(void)` | 位置与位置目标**一起**清零（分两步做容易只做一半） |
@@ -733,10 +735,22 @@ TIM3 编码器模式，AB 正交**四倍频**。**408 边沿 / 输出轴圈**。
 
 - ⚠️ **`control_tick()` 在中断里**：全是寄存器操作和几次浮点乘加，**不许阻塞、不许 `HAL_Delay`、不许 `printf`、不许刷屏**。它用的都是中断安全的接口：`bsp_angle_poll/trigger`、`bsp_encoder_update/total/delta`、`bsp_motor_set_duty/coast`。
 - ⚠️ **`START` 与 `RANGE` 是两个目的不同的窗口**（见 [control.h](../app/control/control.h) 的「盲区陷阱」）：
-  - `START`（默认 150，≈±12°）**只在 `RUN` 瞬间**检查，挡「摆杆垂着/躺着被误启动」；
+  - `START`（默认 150，≈±12°）在**两个时刻**检查：`RUN` 的瞬间，以及**启摆交棒**的瞬间。
+    挡的是「摆杆垂着/躺着被当成已经立好」；
   - `RANGE`（默认 500，≈±41°）**运行中每 1 ms** 检查，挡「立着立着倒了」。
 
   本台实测**自由下垂读数 1883 落在 `RANGE` 内、`START` 外**，所以两个窗口缺一不可。
+- ⚠️ **自动启摆**（`CONTROL_STATE_SWING_UP`）：移植自参考工程 `16-倒立摆-自动启摆` 的
+  1 ms 状态机——每 40 ms 采样、检测摆动顶点、打一组方向相反的瞬时脉冲（`SWP` 占空比、
+  每个 `SWT` 毫秒），把摆杆荡到竖直附近后交给双环。
+  期间**两个 PID 环都不算**，`control_is_running()` 返回 false（它问的是"双环在不在跑"）；
+  要看总状态请读快照的 `state`。
+  - ⚠️ **交棒用的窗口是 `START`（±150）而不是参考的 `RANGE`（±500）**：本台实测
+    自由下垂读数 1883 落在 `CENTER ± 500` 里，用 RANGE 会把**垂着的**摆杆判成"已立好"
+    而直接交给 PID（默认增益下电机会猛冲）。改用 START 后，**交棒条件 == RUN 的准入条件**。
+  - ⚠️ **有 30 秒超时**（参考没有），超时后自动停机并把结局记成 `CONTROL_SWING_TIMEOUT`。
+  - 参数 `SWP`（默认 630 = 参考的 35% × 18）与 `SWT`（默认 100 ms）**是按设备标定的量**，
+    可在线改。
 - `control_param_set()` 会挡 NaN / inf，并对 `CENTER`(≤4095) / `RANGE`(1~2048) / `START`(1~2048) / `OFFSET`(0~max) 做范围检查。**`RANGE = 0` 会退化成「角度永远不在窗口内」，所以下限是 1。**
 - 并发：参数是 32 位对齐的 float，Cortex-M3 上单条 `STR` 写入不会撕裂，且一次只改一个字段，**故不加临界区**（理由写在 `control.c`）。
 
@@ -763,13 +777,30 @@ ASCII 行协议，**给「调参 agent」用的遥控器**。协议规格完整�
 ```
 SET <参数名> <值>      → OK <名>=<值>
 GET <名> | GET ALL     → OK ...
-STAT                   → OK ANGLE=.. POS=.. SPD=.. ATAR=.. AOUT=.. POUT=.. PWM=.. RUN=..
-RUN / STOP             → OK RUN=1 / OK RUN=0
+STAT                   → OK ANGLE=.. POS=.. SPD=.. ATAR=.. AOUT=.. POUT=..
+                            PWM=.. RUN=.. ST=.. SWR=..
+RUN                    → OK RUN=1        角度不在 START 窗口内则 ERR NOT_READY
+SWING                  → OK ST=1|2       在窗口内等价于 RUN，否则先自动启摆
+STOP                   → OK RUN=0
 ZERO                   → OK POS=0 TARGET=0
 TARGET <整数>           → OK TARGET=<n>
-STREAM <0|1>           → OK STREAM=<n>   （按 20 ms 周期吐一行 CSV，列序与 STAT 一一对应）
+STREAM <0|1>           → OK STREAM=<n>   （按 20 ms 周期吐一行 CSV，列序与 STAT 的前 8 列一一对应）
 HELP                   → OK CMD=.. PARAM=..
 ```
+
+`RUN` 与 `SWING` 的分工：
+
+| | 角度已在 `CENTER ± START` 内 | 不在窗口内 |
+| --- | --- | --- |
+| `RUN` | 进双环 PID，`OK RUN=1` | **拒绝**，`ERR NOT_READY ANGLE_OUT_OF_WINDOW` |
+| `SWING` | 同 `RUN`，`OK ST=1` | **自动启摆**，`OK ST=2`，荡进窗口后自动转成双环 |
+
+保留两套而不是让 `RUN` 自动回退，是为了让「角度不对就该拒」这条已验证的判断
+仍能被单独测到，也让"会真的甩电机"必须被调用者**显式**要求。
+
+`STAT` 末尾两个状态字段：`ST`（0 停 / 1 双环 / 2 启摆中）与
+`SWR`（上次启摆结局：0 没启摆过 / 1 成功 / 2 超时 / 3 被 STOP 打断）。
+**`RUN` 只有 0/1，分不出「停着」和「正在启摆」，所以判断状态要用 `ST`。**
 
 响应只有 `OK ` / `ERR ` 两种前缀；`ERR` 后面**必定带原因和出错的那个词**
 （`UNKNOWN_PARAM` / `BAD_VALUE` / `OUT_OF_RANGE` / `UNKNOWN_CMD` / `USAGE` / `LINE_TOO_LONG`）——
@@ -780,7 +811,8 @@ HELP                   → OK CMD=.. PARAM=..
 - **命令只在主循环里跑**：会调 `control_start()` 等接口，**不要放进中断**。
 - ⚠️ **发一条、等一条响应，再发下一条**。OLED 整屏刷新实测约 122 ms，这期间 `console_poll()` 完全拿不到 CPU；115200 下 122 ms 能进来约 1400 字节，而接收环形缓冲只有 256 字节——**连发必定丢，而且丢得不声不响**。
 - ⚠️ **`RUN` 会让电机真的转**。想在不扰动机构的前提下测逻辑，把增益和 `OFFSET` 全设 0——控制环照常跑（分频、采样、倒下判定都执行），但输出恒为 0。
-- ⚠️ **启动前必须手扶摆杆到竖直附近**：`RUN` 时用 `START` 检查当前角度，不在窗口内回 `ERR NOT_READY ANGLE_OUT_OF_WINDOW`。**agent 应当在 `RUN` 之前先 `STAT` 确认 `ANGLE` 靠近 `CENTER`**，而不是假设它一定在。
+- ⚠️ **`RUN` 前必须手扶摆杆到竖直附近**：`RUN` 时用 `START` 检查当前角度，不在窗口内回 `ERR NOT_READY ANGLE_OUT_OF_WINDOW`。**agent 应当在 `RUN` 之前先 `STAT` 确认 `ANGLE` 靠近 `CENTER`**，而不是假设它一定在。**不想手扶就用 `SWING`** —— 它自己把摆杆荡进这个窗口。
+- ⚠️ **`SWING` 也会让电机真的转**（比 `RUN` 更凶：按 `SWP` 的占空比反复打脉冲）。要验证状态机而不扰动机构，把 `SWP` 设成 0 —— 状态机照常跑，但每个脉冲的占空比都是 0（`console_test.py` 第 8b 组就是这么做的）。
 - `STREAM 1` 期间主循环停刷屏，换来满速 50 行/秒、零空洞的等间距采样；`STREAM 0` 立刻恢复刷屏。
 
 ---
