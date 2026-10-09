@@ -35,8 +35,9 @@
 #include "bsp_encoder.h"
 #include "bsp_angle.h"
 
-/* printf 走 bsp_serial 的发送缓冲（_write 已在那里重定向） */
-#include <stdio.h>
+/* 双环 PID 控制器 + 串口调参控制台 */
+#include "control.h"
+#include "console.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -46,78 +47,79 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* 屏幕上各元素的位置（单位：像素）。集中在这里，改版式不用翻代码。 */
-#define OLED_LINE_TITLE_Y       (0U)    /* 标题，Font_7x10，占 0~9      */
+/*
+ * 屏幕上各元素的位置（单位：像素）。
+ *
+ * 版式是**左右双列**（仿官方）：左列是内环（角度环），右列是外环（位置环），
+ * 这样调参时一眼能看出「改的是哪个环、两个环现在各在干什么」。
+ *
+ * Font_6x8 宽 6 像素、屏宽 128，一行放得下 21 个字符。
+ * 两列各占 10 个字符，第二列从第 11 个字符（x=66）开始。
+ */
+#define OLED_LINE_TITLE_Y       (0U)    /* 标题行，Font_7x10，占 0~9 */
+#define OLED_COL0_X             (0U)    /* 左列：角度环 */
+#define OLED_COL1_X             (66U)   /* 右列：位置环 */
 
 /*
- * 数据行行距 10 像素。Font_6x8 高 8，所以 10 像素只留 2 像素间隙，
- * 刚好不重叠又紧凑。标题占 0~9，数据行从 12 开始：
- *   12~19、22~29、32~39、42~49，底部 54~61 留给按键提示。
+ * 数据行行距 8 像素 —— 刚好等于 Font_6x8 的字高，行间不留空隙。
+ * 标题占 0~9，5 行数据从 12 开始：12~19、20~27、28~35、36~43、44~51，
+ * 底部 54~61 留给按键提示。
  */
 #define OLED_ROW_Y0             (12U)
-#define OLED_ROW_STEP           (10U)
+#define OLED_ROW_STEP           (8U)
 
 /* 按键提示行 */
 #define OLED_HINT_Y             (54U)
+
+/* 状态显示的位置（标题行右侧） */
+#define OLED_STATE_X            (96U)
 
 /* PC13 LED 心跳周期（毫秒） */
 #define LED_HEARTBEAT_MS        (500U)
 
 /*
- * 角度采样周期（毫秒）。
+ * 屏幕重画周期（毫秒）。
  *
- * 5 ms 是参考实现里角度环的控制周期——现在就按这个周期采，
- * 等接上 PID 时不用改采样节奏。
+ * ⚠️ 这个值不是「随便定个好看的数」，它直接决定主循环的最坏周期，
+ *    进而决定串口命令的吞吐和 STREAM 的采样率。
+ *
+ *    **实测：刷一整屏要约 122 ms。**
+ *    128×64 的显存是 1024 字节，全屏刷新是「整块重发」，走软件 I2C
+ *    在约 100 kHz 下就是 1024×9 bit ÷ 100 kHz ≈ 92 ms，加上命令字节
+ *    和函数开销正好落到这个量级。
+ *
+ *    （老注释里写的「约 30 ms」是错的，那个数对应约 300 kHz 的 I2C，
+ *      这个软件 I2C 根本达不到。以此为准。）
+ *
+ *    于是这个周期**必须显著大于 122 ms**：等于或小于它的话，
+ *    「距上次刷屏已过 N 毫秒」这个条件每次循环都立刻成立，
+ *    主循环就退化成「刷屏、刷屏、刷屏……」的连续循环，
+ *    周期被锁死在 122 ms，串口在这段时间里根本拿不到 CPU。
+ *    实测：把这里设成 100 时，STREAM 从 50 行/秒掉到 8.2 行/秒。
+ *
+ *    取 500 ms：屏幕 2 Hz 刷新，人眼看着完全够（调参时盯的是数字
+ *    对不对，不是动画）；主循环有约 75% 的时间是空闲的，
+ *    STREAM 能跑到 40 行/秒上下，命令响应也在 120 ms 以内。
+ *
+ *    这里**不用死区判断**（老版本那套）：新界面里 Out 那两列每 5 ms
+ *    都在变，死区永远成立，等于每轮主循环都重画 —— 正是要避免的情形。
  */
-#define ANGLE_SAMPLE_MS         (5U)
+#define DISPLAY_PERIOD_MS       (500U)
 
-/* 每次按键增减的占空比（百分点） */
-#define MOTOR_DUTY_STEP         (10)
+/* 每次按 K2/K3 增减的位置目标步长（边沿）。408 = 横杆转一圈。 */
+#define POS_TARGET_STEP         (408)
 
 /*
- * 显示死区。只有变化超过阈值才重画屏幕。
+ * 本台设备的中心角度 = 2086（2026-10-09 手扶实测）。
  *
- * 为什么需要：ADC 末位总在抖（±1~2 LSB），而刷一屏要 ~30 ms 的 I2C 传输。
- * 若「一变就重画」，摆杆静止时屏幕也在不停重刷，既浪费又让末位数字闪。
+ * 这个值现在已经搬到控制层去了（control.c 的 CONTROL_DEFAULT_CENTER），
+ * 因为它属于「被控对象的标定」，不属于应用逻辑。想改中心角度有两条路：
+ *   · 串口：`SET CENTER 2086`
+ *   · 或改 control.c 的默认值（掉电后仍生效的那个）
+ *
+ * 标定依据（12.22 码/度、满量程 335° 与手册 333° 吻合、盲区说明）
+ * 记在 control.h 的文件头里，那里才是它该在的地方。
  */
-#define ANGLE_DISPLAY_DEADBAND  (8U)
-#define ENCODER_DISPLAY_DEADBAND (2)
-
-/*
- * ── 本台设备的标定值（2026-10-09 实测，用 bsp_angle_raw() 读）────────
- * 下面这些**不是猜的**，是在这台机器上量出来的。换一台设备要重新量。
- *
- *   摆杆竖直（手扶测得）  raw ≈ 2086   ⚠️ 见下面的「测法」说明
- *   水平向左（逆时针90°） raw ≈  960
- *   水平向右（顺时针90°） raw ≈ 3160
- *
- * 由此推算：
- *   · 12.22 LSB/度（每 90° 约 1100 LSB，两方向对称到 4.7% 以内）
- *   · 满量程 4095 LSB ÷ 12.22 = 335°，与手册标称的「有效角度 333°」
- *     吻合到 0.6% —— 说明 ADC 线性、通道正确、传感器型号相符
- *   · 读数随「顺时针转动而增大」
- *
- * ⚠️ 测法要交代清楚：2086 是**用手扶到竖直**读的，手扶精度就是 3° 量级
- *    （12.22 LSB/度 → 2086 与理想中点 2048 差 38 LSB ≈ 3.1°），
- *    所以这个数**还带着手测误差**，不能当作最终值。
- *
- *    **权威测法是让摆杆自由下垂**：自由悬挂的摆杆，重心必然停在支点
- *    正下方 —— 这就是「竖直」的定义（由重力给出，不是由人眼给出）。
- *    松手等它停稳再读，误差就消掉了。调 PID 之前应当这样复核一次。
- *
- * ⚠️ 但无论如何**不能用理想的 2048**：2048 是电位器的**电气中点**，
- *    与「摆杆竖直」没有任何物理必然联系 —— 两者是否重合取决于机械
- *    安装相位。参考实现给的是一个**区间**（1900~2200）而不是一个数，
- *    正说明中心值要被测出来。
- *    用错中心的后果（参考实现明确警告过）：摆杆总是往一个方向跑、
- *    位置环出现稳态误差。3° 看着小，但角度环增益很大，会被放大。
- *
- * ⚠️ 参考实现取「中心 ±500 LSB」为可调控区间，换算到本台设备约
- *    ±41°。超出这个范围就说明摆杆已经倒了，应当停机而不是继续调。
- * ────────────────────────────────────────────────────────────────
- */
-#define ANGLE_CENTER_MEASURED   (2086U)   /* 手扶测得，待自由下垂复核 */
-#define ANGLE_LSB_PER_DEGREE    (12.22)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -140,24 +142,17 @@ UART_HandleTypeDef huart1;
 static ssd1306_t s_oled;
 
 /*
- * 上一次真正画到屏幕上的值。
- * 用它和新采样值比较，决定要不要重画——见 ANGLE_DISPLAY_DEADBAND 的说明。
- */
-static uint16_t s_shown_angle = 0U;
-static int32_t  s_shown_total = 0;
-static int16_t  s_shown_duty  = 0;
-static bool     s_shown_run   = false;
-
-/*
- * 应用层的运行状态与占空比目标值。
+ * 现在**没有**「应用层运行状态」这个变量了。
  *
- * 为什么要有 s_duty_cmd 而不是直接问 bsp_motor_duty()：
- * 停机时驱动层被强制成 0（coast），但用户按 K2/K3 设的值要留着，
- * 下次按 K1 启动时接着用。所以「命令值」存在应用层，
- * 「实际值」由驱动层维护，两者分开。
+ * 老版本这里有一对 s_run / s_duty_cmd，因为那时应用层要自己拿捏
+ * 「按 K1 切状态、把占空比写到电机」。现在这件事整个归 control 模块管
+ * （它有自己的状态机和双环），main.c 只管转发按键和显示。
+ *
+ * 要紧的是**状态只有一份**：如果 main.c 再存一份 s_run，就和
+ * control 内部那份成了两个真相，迟早会出现「屏幕显示 RUN、
+ * 实际已经因为摔倒自动停机了」这种对不上的情况。
+ * 需要的时候问 `control_is_running()` 就行。
  */
-static int16_t   s_duty_cmd = 0;
-static bool      s_run      = false;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -172,9 +167,10 @@ static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
 static uint8_t oled_u32_to_dec(uint32_t value, char *out);
 static uint8_t oled_i32_to_dec(int32_t value, char *out);
-static void    oled_row(uint16_t y, const char *text);
+static void    oled_cell(uint16_t x, uint16_t y, const char *label, int32_t value, uint8_t digits);
+static void    oled_cell_f2(uint16_t x, uint16_t y, const char *label, float value);
 static void    oled_redraw(void);
-static void    app_1ms_task(void);
+static void    app_pos_target_step(int32_t delta);
 static void    app_handle_keys(void);
 static void    app_refresh_display(void);
 static void    app_fatal_blink(uint8_t code);
@@ -237,32 +233,86 @@ static uint8_t oled_i32_to_dec(int32_t value, char *out)
 }
 
 /**
-  * @brief  在指定行写一行以 '\0' 结尾的文本（统一用 Font_6x8）。
-  * @param  y    该行顶部像素坐标
-  * @param  text 待写字符串
+  * @brief  在任意坐标写一段以 '\0' 结尾的文本（统一用 Font_6x8）。
+  * @param  x,y  左上角像素坐标
   * @note   一行 128 像素 / 每字符 6 像素 = **最多 21 个字符**，
   *         超出的部分会被 ssd1306_write_string 静默截断。
   */
-static void oled_row(uint16_t y, const char *text)
+static void oled_text(uint16_t x, uint16_t y, const char *text)
 {
-  (void)ssd1306_set_cursor(&s_oled, 0U, y);
+  (void)ssd1306_set_cursor(&s_oled, x, y);
   (void)ssd1306_write_string(&s_oled, text, &Font_6x8, SSD1306_WHITE);
 }
 
 /**
-  * @brief  写一行「标签 + 右对齐数值」。
-  * @param  y      该行顶部像素坐标
-  * @param  label  左侧标签（如 "Spd"）
-  * @param  value  数值（有符号）
-  * @param  digits 数值占的字符宽度（含负号）
+  * @brief  把浮点转成定点两位小数的字符串（如 "-1800.00"）。
+  * @param  value 待转换的值
+  * @param  out   输出缓冲，调用者需保证至少 13 字节
+  * @retval 写入的字符数（不含结尾 '\0'）
   *
-  * 右对齐是必要的：不补空格的话，数值从 4 位掉到 3 位时后面的内容
-  * 会整体左移，看起来像在「抖」。
+  * 屏幕上不显示浮点的原始精度：增益的有效位数就到百分位，
+  * 多打几位只是让数字在跳，反而看不清。
   */
-static void oled_row_value(uint16_t y, const char *label, int32_t value, uint8_t digits)
+static uint8_t oled_f2_to_dec(float value, char *out)
+{
+  char     num[13];
+  uint8_t  k = 0U;
+  int32_t  cents;
+  uint32_t mag;
+
+  /* 防御：NaN 进去会让下面两个比较都不成立，cents 变成垃圾值。
+   * 正常的增益不会走到这里（control_param_set 已经挡过）。 */
+  if (value != value) {
+    out[0] = 'n'; out[1] = 'a'; out[2] = 'n'; out[3] = '\0';
+    return 3U;
+  }
+
+  /* 夹一下再乘 100：不夹的话 value*100 可能溢出 int32，是未定义行为 */
+  if (value >  99999.0f) { value =  99999.0f; }
+  if (value < -99999.0f) { value = -99999.0f; }
+
+  /* 四舍五入到百分位。加 ±0.5 而不是用 roundf()，省一个库依赖。 */
+  cents = (int32_t)((value * 100.0f) + ((value >= 0.0f) ? 0.5f : -0.5f));
+
+  if (cents < 0) {
+    out[k] = '-';
+    k++;
+  }
+
+  /* 取相反数走 uint32 中转：int32 的 -(-2147483648) 会溢出 */
+  mag = (cents < 0) ? ((uint32_t)(-(cents + 1)) + 1U) : (uint32_t)cents;
+
+  (void)oled_u32_to_dec(mag / 100U, num);
+  for (const char *p = num; *p != '\0'; p++) {
+    out[k] = *p;
+    k++;
+  }
+
+  out[k] = '.';                                   k++;
+  out[k] = (char)('0' + ((mag % 100U) / 10U));    k++;
+  out[k] = (char)('0' + (mag % 10U));             k++;
+  out[k] = '\0';
+
+  return k;
+}
+
+/**
+  * @brief  写一个「3 字符标签 + 右对齐数值」的显示单元。
+  * @param  x,y    单元左上角像素坐标
+  * @param  label  标签，固定 3 个字符（如 "AKP"）
+  * @param  value  数值
+  * @param  digits 数值占的字符宽度，本界面统一用 7
+  *
+  * 整个单元固定 3+digits 个字符宽，左右两列各排一列。
+  *
+  * ⚠️ 数值**必须补齐**（右对齐），不能不足就让后面的内容左移 ——
+  *    否则数值位数一变整行就会左右跳动，看起来像屏幕在抖，
+  *    而且两列对不齐。这是显示代码里最常见的毛病。
+  */
+static void oled_cell(uint16_t x, uint16_t y, const char *label, int32_t value, uint8_t digits)
 {
   char    num[13];
-  char    msg[22];
+  char    msg[16];
   uint8_t k = 0U;
   uint8_t n;
 
@@ -284,126 +334,148 @@ static void oled_row_value(uint16_t y, const char *label, int32_t value, uint8_t
 
   msg[k] = '\0';
 
-  oled_row(y, msg);
+  oled_text(x, y, msg);
 }
 
 /**
-  * @brief  角度行：同时显示原始值与折算电压。
+  * @brief  同 oled_cell，但数值是浮点、固定两位小数。
   *
-  * 两个值一起显示是有意的——**电压是验证接线的判据**：
-  * 把摆杆从一端缓慢转到另一端，电压应从接近 0 连续变到接近 3300 mV。
-  * 恒为 0 或恒为满量程就说明接线有问题，而不是代码问题。
+  * 始终按 7 个字符宽补齐，所以和一个用 oled_cell 的单元排在同一列时
+  * 也是对齐的。
   */
-static void oled_draw_angle_row(uint16_t y)
+static void oled_cell_f2(uint16_t x, uint16_t y, const char *label, float value)
 {
   char    num[13];
-  char    msg[22];
+  char    msg[16];
   uint8_t k = 0U;
   uint8_t n;
 
-  msg[k] = 'A'; k++;
-  msg[k] = 'n'; k++;
-  msg[k] = 'g'; k++;
+  for (const char *p = label; *p != '\0'; p++) {
+    msg[k] = *p;
+    k++;
+  }
 
-  n = oled_u32_to_dec((uint32_t)bsp_angle_raw(), num);
-  for (uint8_t i = n; i < 5U; i++) { msg[k] = ' '; k++; }
-  for (uint8_t i = 0U; i < n; i++) { msg[k] = num[i]; k++; }
+  n = oled_f2_to_dec(value, num);
 
-  msg[k] = ' '; k++;
-
-  n = oled_u32_to_dec((uint32_t)bsp_angle_millivolt(), num);
-  for (uint8_t i = n; i < 4U; i++) { msg[k] = ' '; k++; }
-  for (uint8_t i = 0U; i < n; i++) { msg[k] = num[i]; k++; }
-
-  msg[k] = 'm'; k++;
-  msg[k] = 'V'; k++;
-  msg[k] = '\0';
-
-  oled_row(y, msg);
-}
-
-/**
-  * @brief  占空比行：数值 + 运行状态。
-  * @param  run true 显示 RUN，false 显示 STOP
-  */
-static void oled_draw_duty_row(uint16_t y, int16_t duty, bool run)
-{
-  char        num[13];
-  char        msg[22];
-  uint8_t     k = 0U;
-  const char *state = run ? "RUN" : "STOP";
-  const uint8_t n = oled_i32_to_dec((int32_t)duty, num);
-
-  msg[k] = 'D'; k++;
-  msg[k] = 'u'; k++;
-  msg[k] = 't'; k++;
-  msg[k] = 'y'; k++;
-
-  for (uint8_t i = n; i < 5U; i++) { msg[k] = ' '; k++; }
-  for (uint8_t i = 0U; i < n; i++) { msg[k] = num[i]; k++; }
-
-  msg[k] = ' '; k++;
-  msg[k] = ' '; k++;
-
-  for (const char *p = state; *p != '\0'; p++) { msg[k] = *p; k++; }
+  for (uint8_t i = n; i < 7U; i++) {
+    msg[k] = ' ';
+    k++;
+  }
+  for (uint8_t i = 0U; i < n; i++) {
+    msg[k] = num[i];
+    k++;
+  }
 
   msg[k] = '\0';
 
-  oled_row(y, msg);
+  oled_text(x, y, msg);
 }
 
 /**
   * @brief  整屏重画并按内容重新上屏。
   *
+  * 版式（左右双列，左=内环角度环，右=外环位置环）：
+  *
+  *     Pendulum              RUN
+  *     AKP   4.50   PKP   9.36
+  *     AKI   0.16   PKI   0.18
+  *     AKD   7.38   PKD  82.08
+  *     Ang   2086   Loc      0
+  *     ATr   2086   LTr      0
+  *     AOu    123   POu   0.00
+  *
+  * **没有按键提示行**，是刻意的取舍：6 行数据已经把 64 像素的屏占满
+  * （标题 0~9，数据 12~59），再挤一行提示就得砍掉一整行数据。
+  * 而这一屏是为**调参**服务的，两个环的目标值比按键提示有用得多；
+  * 按键功能在 README 和 docs/ 里都有。
+  *
   * 整屏重画而不是只改变化的那一块：这个规模下更简单，也绝不会留残影
   * （比如数值从 1000 掉到 999 时旧的那一位干不掉）。代价是每次约 30 ms
-  * 的 I2C 传输，所以**调用前必须先用死区判断值是否真的变了**
-  * （见 app_refresh_display），否则摆杆静止时屏幕也在不停空刷。
+  * 的 I2C 传输，所以调用它的频率由调用者把关（见 DISPLAY_PERIOD_MS）。
   */
 static void oled_redraw(void)
 {
+  control_status_t        st;
+
+  control_get_status(&st);
+
   ssd1306_fill(&s_oled, SSD1306_BLACK);
 
-  /* 标题 */
+  /* 标题 + 运行状态。
+   * 状态直接问 control 模块，不在 main 里另存一份 —— 见 PV 段的说明。 */
   (void)ssd1306_set_cursor(&s_oled, 0U, OLED_LINE_TITLE_Y);
   (void)ssd1306_write_string(&s_oled, "Pendulum", &Font_7x10, SSD1306_WHITE);
+  oled_text(OLED_STATE_X, OLED_LINE_TITLE_Y, control_is_running() ? "RUN" : "STOP");
 
-  oled_draw_angle_row(OLED_ROW_Y0);
-  oled_row_value((uint16_t)(OLED_ROW_Y0 + (OLED_ROW_STEP * 1U)),
-                 "Spd", (int32_t)bsp_encoder_delta(), 5U);
-  oled_row_value((uint16_t)(OLED_ROW_Y0 + (OLED_ROW_STEP * 2U)),
-                 "Pos", bsp_encoder_total(), 7U);
-  oled_draw_duty_row((uint16_t)(OLED_ROW_Y0 + (OLED_ROW_STEP * 3U)), s_duty_cmd, s_run);
+  const uint16_t x0  = OLED_COL0_X;
+  const uint16_t x1  = OLED_COL1_X;
+  const uint16_t y0  = OLED_ROW_Y0;
+  const uint16_t y1  = (uint16_t)(OLED_ROW_Y0 + (OLED_ROW_STEP * 1U));
+  const uint16_t y2  = (uint16_t)(OLED_ROW_Y0 + (OLED_ROW_STEP * 2U));
+  const uint16_t y3  = (uint16_t)(OLED_ROW_Y0 + (OLED_ROW_STEP * 3U));
+  const uint16_t y4  = (uint16_t)(OLED_ROW_Y0 + (OLED_ROW_STEP * 4U));
+  const uint16_t y5  = (uint16_t)(OLED_ROW_Y0 + (OLED_ROW_STEP * 5U));
 
-  oled_row(OLED_HINT_Y, "K1 run  K2+  K3-  K4 clr");
+  /* ① 三个增益 —— 调参时眼睛盯得最多的就是这几行。
+   *    用 control_params() 拿的是**当前生效值**，和串口改的是同一份。 */
+  const control_params_t *pp = control_params();
+
+  oled_cell_f2(x0, y0, "AKP", pp->a_kp);
+  oled_cell_f2(x1, y0, "PKP", pp->p_kp);
+  oled_cell_f2(x0, y1, "AKI", pp->a_ki);
+  oled_cell_f2(x1, y1, "PKI", pp->p_ki);
+  oled_cell_f2(x0, y2, "AKD", pp->a_kd);
+  oled_cell_f2(x1, y2, "PKD", pp->p_kd);
+
+  /* ② 两个环的实测量。
+   *    "Ang" 用 st.angle 而不是再采一次：取的是控制环**正在用的**
+   *    那一个采样，显示和实际参与运算的完全一致。 */
+  oled_cell(x0, y3, "Ang", (int32_t)st.angle, 7U);
+  oled_cell(x1, y3, "Loc", st.position, 7U);
+
+  /* ③ 两个环的目标值。
+   *    ATr 在运行中会随外环输出微动 —— 那是正常的，正是串级结构
+   *    在「挪动内环目标」。它一直等于 CENTER 反而说明外环没在干活。 */
+  oled_cell(x0, y4, "ATr", (int32_t)st.angle_target, 7U);
+  oled_cell(x1, y4, "LTr", control_position_target(), 7U);
+
+  /* ④ 两个环的输出。
+   *    AOu 是限幅后、**未叠静摩擦补偿**的值（补偿量见串口 GET OFFSET）；
+   *    真正写到电机上的是 st.pwm，想看它就串口打 STAT。 */
+  oled_cell(x0, y5, "AOu", (int32_t)st.angle_out, 7U);
+  oled_cell_f2(x1, y5, "POu", st.pos_out);
 
   (void)ssd1306_update_screen(&s_oled);
 }
 
 /**
-  * @brief  1 ms 节拍任务：只推进一次编码器游标。
+  * @brief  按步长移动位置目标，越界就**不动**（不是夹到边界）。
   *
-  * 整个任务只做一件事——读一次 TIM3 的 CNT 并累加到位置里。这是纯
-  * 寄存器访问，几十个周期就结束，符合「快进快出」。
-  *
-  * ⚠️ **角度采样不在这里**：bsp_angle_sample() 内部靠 HAL_GetTick()
-  *    做超时判断，而 1 ms 节拍所在的 TIM1 抢占优先级（1）高于
-  *    SysTick（15），在节拍任务里 uwTick 不涨——一旦某次转换没有正常
-  *    完成，等待会永久卡死，整个系统从此失去节拍。它留在主循环。
+  * 夹到边界的坏处：按到边界之后继续按没任何反馈，用户以为按键坏了。
+  * 不动至少和「已经到头了」是一致的表现，而且控制台里 TARGET 命令
+  * 会明确回 OUT_OF_RANGE。
   */
-static void app_1ms_task(void)
+static void app_pos_target_step(int32_t delta)
 {
-  (void)bsp_encoder_update();
+  const int32_t target = control_position_target() + delta;
+
+  if ((target >= -CONTROL_POS_TARGET_LIMIT) && (target <= CONTROL_POS_TARGET_LIMIT)) {
+    (void)control_set_position_target(target);
+  }
 }
 
 /**
-  * @brief  处理按键事件并同步电机状态。
+  * @brief  处理按键事件。
   *
-  * 按键分工：
-  *   K1 —— 启动 / 停止（停止 = 滑行，不是刹车）
-  *   K2 —— 占空比 +10
-  *   K3 —— 占空比 -10
-  *   K4 —— 编码器位置清零，并停机
+  * 按键分工（**改成了官方那套语义**）：
+  *   K1 —— 启动 / 停止控制
+  *   K2 —— 位置目标 +408（横杆正转一圈）
+  *   K3 —— 位置目标 −408（横杆反转一圈）
+  *   K4 —— 位置清零（位置计数与目标一起归零）并停机
+  *
+  * 老版本的 K2/K3 是「直接加减电机占空比」，那是纯驱动测试用的。
+  * 有了闭环之后手动给占空比没有意义（控制环每 5 ms 就会覆盖掉），
+  * 所以改成调位置目标。
   *
   * ⚠️ 每个键都要用 while 取干净，而不是 if 一次：一次完整的按放会
   *    同时挂起 PRESS 和 RELEASE 两个事件，只取一次会把 RELEASE 留下
@@ -421,27 +493,27 @@ static void app_handle_keys(void)
 
       switch ((key_id_t)i) {
         case KEY_ID_K1:
-          s_run = !s_run;
+          /* 角度不在中心窗口内时 control_start() 会拒绝启动 ——
+           * 这是有意的，见 control.h 的盲区陷阱说明。
+           * 按 K1 没反应时先看屏幕上的 Ang：多半是摆杆没扶到竖直附近。 */
+          if (control_is_running()) {
+            (void)control_stop();
+          } else {
+            (void)control_start();
+          }
           break;
 
         case KEY_ID_K2:
-          s_duty_cmd = (int16_t)(s_duty_cmd + MOTOR_DUTY_STEP);
-          if (s_duty_cmd > (int16_t)BSP_MOTOR_DUTY_MAX) {
-            s_duty_cmd = (int16_t)BSP_MOTOR_DUTY_MAX;
-          }
+          app_pos_target_step((int32_t)POS_TARGET_STEP);
           break;
 
         case KEY_ID_K3:
-          s_duty_cmd = (int16_t)(s_duty_cmd - MOTOR_DUTY_STEP);
-          if (s_duty_cmd < -(int16_t)BSP_MOTOR_DUTY_MAX) {
-            s_duty_cmd = -(int16_t)BSP_MOTOR_DUTY_MAX;
-          }
+          app_pos_target_step(-(int32_t)POS_TARGET_STEP);
           break;
 
         case KEY_ID_K4:
-          (void)bsp_encoder_reset();
-          s_duty_cmd = 0;
-          s_run      = false;
+          (void)control_zero_position();
+          (void)control_stop();
           break;
 
         default:
@@ -452,62 +524,38 @@ static void app_handle_keys(void)
 }
 
 /**
-  * @brief  把应用层的运行状态/占空比落到电机上。
+  * @brief  按固定周期重画屏幕。
   *
-  * 每轮主循环都调一次：未运行时强制滑行（保证「STOP」状态下电机一定
-  * 不转，哪怕 K2/K3 改过占空比），运行时才把命令值写下去。
-  * 每次只是几个寄存器写，开销可以忽略。
-  */
-static void app_apply_motor(void)
-{
-  if (s_run) {
-    (void)bsp_motor_set_duty(s_duty_cmd);
-  } else {
-    (void)bsp_motor_coast();
-  }
-}
-
-/**
-  * @brief  按周期采样角度，并在数值变化超过死区时重画屏幕。
-  *
-  * 死区是必需的：刷一屏要约 30 ms 的 I2C 传输，而编码器位置在电机
-  * 转动时每个循环都在变。不设死区就会以主循环的速度（远高于 30 ms
-  * 一次）不停重画，屏幕反而永远刷不完。
+  * 周期由 DISPLAY_PERIOD_MS 决定，**不按内容变化触发** —— 理由见那里的
+  * 说明：新界面里 Out 那两列每 5 ms 都在变，任何死区都会永远成立，
+  * 等于每轮主循环都重画，反而把主循环彻底堵死。
   */
 static void app_refresh_display(void)
 {
-  static uint32_t last_sample_ms = 0U;
+  static uint32_t last_ms = 0U;
 
-  const uint32_t now_ms = HAL_GetTick();
-  if ((now_ms - last_sample_ms) < ANGLE_SAMPLE_MS) {
-    return;                             /* 还没到下一次采样时刻 */
-  }
-  last_sample_ms = now_ms;
-
-  if (bsp_angle_sample() != ERR_OK) {
-    return;                             /* 本次读取失败，保留上次的值 */
-  }
-
-  const uint16_t angle   = bsp_angle_raw();
-  const int32_t  total   = bsp_encoder_total();
-  const int32_t  angle_d = (int32_t)angle - (int32_t)s_shown_angle;
-  const int32_t  total_d = total - s_shown_total;
-
-  const bool dirty = (angle_d >= (int32_t)ANGLE_DISPLAY_DEADBAND) ||
-                     (angle_d <= -(int32_t)ANGLE_DISPLAY_DEADBAND) ||
-                     (total_d >= (int32_t)ENCODER_DISPLAY_DEADBAND) ||
-                     (total_d <= -(int32_t)ENCODER_DISPLAY_DEADBAND) ||
-                     (s_duty_cmd != s_shown_duty) ||
-                     (s_run != s_shown_run);
-
-  if (!dirty) {
+  /*
+   * STREAM 开着时**完全不刷屏**。
+   *
+   * 理由：刷一屏要 ~122 ms 的 CPU（见 DISPLAY_PERIOD_MS），这段时间里
+   * console_poll() 拿不到 CPU，STREAM 的数据就会出现一个 122 ms 的空洞，
+   * 采样率也从 50 掉到 38 行/秒。而上位机在画曲线的时候，屏幕根本没人在看。
+   *
+   * 所以串流期间把这 122 ms 全部让给串口 —— 换到的是**满速且等间距**的
+   * 50 行/秒。这对 PID 调参是有实际价值的：曲线的横轴时间戳均匀，
+   * 才能从波形的周期和衰减判断增益是否合适。
+   *
+   * 串流一关（STREAM 0），下一轮循环就恢复刷新，不用做别的动作。
+   */
+  if (console_is_streaming()) {
     return;
   }
 
-  s_shown_angle = angle;
-  s_shown_total = total;
-  s_shown_duty  = s_duty_cmd;
-  s_shown_run   = s_run;
+  const uint32_t now_ms = HAL_GetTick();
+  if ((now_ms - last_ms) < DISPLAY_PERIOD_MS) {
+    return;
+  }
+  last_ms = now_ms;
 
   oled_redraw();
 }
@@ -525,6 +573,8 @@ static void app_refresh_display(void)
   *   7 次 = 编码器（bsp_encoder_init 失败）
   *   8 次 = 角度传感器（bsp_angle_init 失败，ADC1 自校准没成功）
   *   9 次 = 节拍任务注册失败（槽位满了，见 BSP_TICK_MAX_HANDLERS）
+  *  10 次 = 控制器（control_init 失败）
+  *  11 次 = 串口控制台（console_init 失败）
   *
   * @note 本函数不返回。
   */
@@ -632,26 +682,43 @@ int main(void)
   }
 
   /*
-   * 把编码器游标累加挂到 1 ms 节拍上。
-   * 这是本任务唯一的节拍使用者——角度采样留在主循环（理由见
-   * app_1ms_task 的说明）。节拍还剩 2 个槽位留给以后的 PID 控制环。
+   * 控制器。必须在三个驱动都初始化之后 —— control_init() 会读一次
+   * 角度和编码器来对齐内部快照，驱动没起来的话读到的是 0。
    */
-  if (bsp_tick_register(app_1ms_task) != ERR_OK) {
+  if (control_init() != ERR_OK) {
+    app_fatal_blink(10U);
+  }
+
+  /*
+   * 串口控制台（调参协议）。只是个协议层，不碰 USART 寄存器，
+   * 但要在 bsp_serial_init() 之后。
+   */
+  if (console_init() != ERR_OK) {
+    app_fatal_blink(11U);
+  }
+
+  /*
+   * ── 把控制环挂到 1 ms 节拍上 ──────────────────────────────────
+   *
+   * 这是本工程**唯一**挂在节拍上的任务（按键模块自己也占一个槽位）。
+   *
+   * ⚠️ 控制环为什么必须在中断里、不能留在主循环：
+   *    主循环里刷一次屏要 ~30 ms 的软件 I2C，而角度环的周期是 5 ms。
+   *    放在主循环里，角度环的实际周期会在 5~35 ms 之间乱跳 ——
+   *    等于给控制器灌了一路巨大的周期噪声，摆杆根本立不住。
+   *    挂在节拍上才有稳定的 5 ms / 50 ms。
+   *
+   * 主循环剩下的都是对时间不敏感的事：按键、串口、显示。
+   */
+  if (bsp_tick_register(control_tick) != ERR_OK) {
     app_fatal_blink(9U);
   }
 
   /*
-   * 先采一次，让屏幕第一次画出来就有真实读数而不是全 0。
-   * 位置也一并刷新，作为显示死区的比较基准。
+   * 画一次初始界面。
+   * 控制器此刻是 STOP，电机已经被 control_init() 置成滑行 ——
+   * 上电时摆杆应该是静止下垂的，这一刻不能有任何动作。
    */
-  (void)bsp_angle_sample();
-  (void)bsp_encoder_update();
-  s_shown_angle = bsp_angle_raw();
-  s_shown_total = bsp_encoder_total();
-  s_shown_duty  = 0;
-  s_shown_run   = false;
-
-  /* 画一次初始界面。之后只在读数变化超过死区时重画。 */
   oled_redraw();
 
   uint32_t last_led_ms = HAL_GetTick();
@@ -665,18 +732,20 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     /*
-     * 前台主循环：处理按键、把状态落到电机、按周期采样角度并刷屏、翻 LED。
+     * 前台主循环：按键、串口、显示、心跳灯。
      *
      * 注意这里**没有 HAL_Delay**。在循环里死等会让所有周期性动作
      * 互相拖累（比如屏幕每 30 ms 刷一次，若用延时来定时，
-     * 角度的采样周期就变成了「30 ms + 延时」）。
+     * 串口的处理周期就变成了「30 ms + 延时」）。
      * 所以一律用「查时间、时间到了才做」的非阻塞写法。
      *
-     * 每次循环只做一次 HAL_GetTick() 比较，几乎不耗时；
-     * 真正干活（采样、刷屏）都由各自的时间条件把关。
+     * ⚠️ 主循环里**没有**「把控制结果写到电机」这一步：那是
+     *    control_tick() 在中断里做的。主循环里再写一次只会和它打架。
+     *    同理也没有角度采样 —— 采样在中断里按 1 ms 恒定节奏做，
+     *    这里是 5~35 ms 的抖动节奏，采出来的值不能用。
      */
+    console_poll();
     app_handle_keys();
-    app_apply_motor();
     app_refresh_display();
 
     const uint32_t now_ms = HAL_GetTick();
@@ -917,9 +986,9 @@ static void MX_TIM2_Init(void)
 
   /* USER CODE END TIM2_Init 1 */
   htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 35;
+  htim2.Init.Prescaler = 1;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 99;
+  htim2.Init.Period = 1799;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)

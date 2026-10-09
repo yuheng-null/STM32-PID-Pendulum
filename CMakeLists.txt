@@ -49,6 +49,11 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 #   driver/bus        总线驱动，直接贴着 HAL
 #   driver/device     器件驱动，只依赖抽象总线接口
 #   bsp               板级支持，把上面几层按本板接线组装起来
+#   algorithm         纯算法，不含任何硬件依赖（能在 PC 上单独编译测试）
+#   app               应用层，把算法和 bsp 组合成具体的功能
+#
+# 依赖方向是单向的：上面的层可以往下依赖，反之不行。
+# 特别是 algorithm/ 不许 include 任何 bsp_* 或 HAL 头文件。
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/driver/bus/i2c/i2c_soft.c
     ${CMAKE_CURRENT_SOURCE_DIR}/driver/device/ssd1306/ssd1306.c
@@ -61,6 +66,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/motor/bsp_motor.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/encoder/bsp_encoder.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/angle/bsp_angle.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/algorithm/pid/pid.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/app/control/control.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/app/console/console.c
 )
 
 # Add include paths
@@ -76,6 +84,9 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/motor
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/encoder
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/angle
+    ${CMAKE_CURRENT_SOURCE_DIR}/algorithm/pid
+    ${CMAKE_CURRENT_SOURCE_DIR}/app/control
+    ${CMAKE_CURRENT_SOURCE_DIR}/app/console
 )
 
 # Add project symbols (macros)
