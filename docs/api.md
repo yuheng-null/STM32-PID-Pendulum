@@ -10,6 +10,9 @@
 | 按键 | [key.md](key.md) |
 | 电位器 | [pot.md](pot.md) |
 | 串口 | [serial.md](serial.md) |
+| 电机 | [motor.md](motor.md) |
+| 编码器 | [encoder.md](encoder.md) |
+| 角度传感器 | [angle.md](angle.md) |
 | 系统节拍 | 见 [bsp/tick/bsp_tick.c](../bsp/tick/bsp_tick.c) 文件头（1 ms 的推导过程） |
 
 **面向读者**：本工程的使用者。假设你会 C、知道中断和 volatile 的基本概念，不需要读过实现。
@@ -30,6 +33,9 @@
   - [2.3 电位器 bsp_pot](#23-电位器--bsppotbsp_poth)
   - [2.4 串口 bsp_serial](#24-串口--bspserialbsp_serialh)
   - [2.5 OLED](#25-oled)
+  - [2.6 电机 bsp_motor](#26-电机--bspmotorbsp_motorh)
+  - [2.7 编码器 bsp_encoder](#27-编码器--bspencoderbsp_encoderh)
+  - [2.8 角度传感器 bsp_angle](#28-角度传感器--bspanglebsp_angleh)
 - [三、调用上下文总表](#三调用上下文总表)
 - [四、主循环最小骨架](#四主循环最小骨架)
 - [五、陷阱清单](#五陷阱清单)
@@ -78,6 +84,10 @@ BSP 层   bsp/{tick,key,pot,serial,oled}/      「这块板上什么接在哪个
 | 3 | 按键（节拍槽位满） |
 | 4 | 电位器（ADC 自校准失败） |
 | 5 | 串口（接收中断没武装上） |
+| 6 | 电机（PWM 没启动起来） |
+| 7 | 编码器（HAL 启动失败） |
+| 8 | 角度传感器（ADC1 自校准失败） |
+| 9 | 节拍任务注册失败（槽位满） |
 
 ### 1.3 句柄与引脚宏
 
@@ -85,11 +95,14 @@ BSP 层   bsp/{tick,key,pot,serial,oled}/      「这块板上什么接在哪个
 
 | 符号 | 类型 | 声明处 |
 | --- | --- | --- |
-| `htim1` | `TIM_HandleTypeDef` | [bsp/tick/bsp_tick.c:35](../bsp/tick/bsp_tick.c#L35) |
-| `hadc2` | `ADC_HandleTypeDef` | [bsp/pot/bsp_pot.c:55](../bsp/pot/bsp_pot.c#L55) |
-| `huart1` | `UART_HandleTypeDef` | [bsp/serial/bsp_serial.c:37](../bsp/serial/bsp_serial.c#L37) |
+| `htim1` | `TIM_HandleTypeDef` | [bsp/tick/bsp_tick.c](../bsp/tick/bsp_tick.c) |
+| `htim2` | `TIM_HandleTypeDef` | [bsp/motor/bsp_motor.c](../bsp/motor/bsp_motor.c) |
+| `htim3` | `TIM_HandleTypeDef` | [bsp/encoder/bsp_encoder.c](../bsp/encoder/bsp_encoder.c) |
+| `hadc1` | `ADC_HandleTypeDef` | [bsp/angle/bsp_angle.c](../bsp/angle/bsp_angle.c) |
+| `hadc2` | `ADC_HandleTypeDef` | [bsp/pot/bsp_pot.c](../bsp/pot/bsp_pot.c) |
+| `huart1` | `UART_HandleTypeDef` | [bsp/serial/bsp_serial.c](../bsp/serial/bsp_serial.c) |
 
-⚠️ 应用层**不要重复定义**这三个符号，也不要改动它们。
+⚠️ 应用层**不要重复定义**这六个符号，也不要改动它们。
 
 **引脚宏**（由 CubeMX 生成在 [main.h](../Core/Inc/main.h)）：
 
@@ -98,8 +111,11 @@ BSP 层   bsp/{tick,key,pot,serial,oled}/      「这块板上什么接在哪个
 | `LED_Pin` / `LED_GPIO_Port` | PC13 | 应用层（心跳 / 错误闪烁） |
 | `KEY1..KEY4_Pin` / `_GPIO_Port` | PB10 / PB11 / PA11 / PA12 | 仅 bsp_key.c 内部 |
 | `OLED_SCL_Pin` / `OLED_SDA_Pin` | PB8 / PB9 | 仅 bsp_oled.c 内部 |
+| `MOTOR_AIN1_Pin` / `_GPIO_Port` | PB12 | 仅 bsp_motor.c 内部 |
+| `MOTOR_AIN2_Pin` / `_GPIO_Port` | PB13 | 仅 bsp_motor.c 内部 |
 
-⚠️ **ADC 通道和 USART1 的引脚 CubeMX 不生成宏**（不像 GPIO 会给 `KEY1_Pin`）。电位器的通道对应表写在 [bsp_pot.c](../bsp/pot/bsp_pot.c) 里，那正是 BSP 层的职责。
+⚠️ **ADC 通道、定时器通道、USART 的引脚 —— CubeMX 都不生成宏**（只有配成 GPIO 的引脚才会给 `KEY1_Pin` 这类宏）。
+所以「哪个通道接什么」的对应表写在 BSP 里，那正是 BSP 层的职责：电位器的 4 个 ADC 通道表在 [bsp_pot.c](../bsp/pot/bsp_pot.c)，电机的 TIM2_CH1 与角度传感器的 ADC1_IN8 同理。
 
 ### 1.4 初始化顺序（硬依赖，不能乱）
 
@@ -107,19 +123,26 @@ BSP 层   bsp/{tick,key,pot,serial,oled}/      「这块板上什么接在哪个
 | --- | --- | --- | --- |
 | 1 | `HAL_Init()` | — | 无 SysTick，`HAL_Delay` 死锁 |
 | 2 | `SystemClock_Config()` | — | 72 MHz 与 ADC 时钟分频都靠它 |
-| 3 | `MX_GPIO_Init()` | — | 引脚浮空；**GPIOB 时钟也在这里使能**，OLED 靠它 |
+| 3 | `MX_GPIO_Init()` | — | 引脚浮空；**GPIOB 时钟也在这里使能**，OLED 与电机方向脚靠它 |
 | 4 | `MX_TIM1_Init()` | — | 只写寄存器，定时器还没跑（要 `bsp_tick_init` 才启动） |
 | 5 | `MX_ADC2_Init()` | — | 通道 / 采样时间 / 扫描模式没配 |
 | 6 | `MX_USART1_UART_Init()` | — | 波特率、字长没配 |
-| 7 | `bsp_oled_init(&s_oled)` | 步骤 3 | GPIOB 时钟没开 → 屏幕无应答 |
-| 8 | `bsp_tick_init()` | 步骤 4 | 节拍不跑 |
-| 9 | `bsp_key_init()` | 步骤 3 **和** 8 | 无 tick：注册失败；无 GPIO：读到浮空电平，**开机会凭空多一次按下事件** |
-| 10 | `bsp_pot_init()` | 步骤 5 | 自校准要求 ADC 关闭（ADON=0），此刻正好满足 |
-| 11 | `bsp_serial_init()` | 步骤 6 | 武装接收中断时串口还没配好 |
+| 7 | `MX_TIM2_Init()` | — | PWM 通道没配（且**定时器还没启动**，见 2.6） |
+| 8 | `MX_TIM3_Init()` | — | 编码器接口没配 |
+| 9 | `MX_ADC1_Init()` | — | 角度传感器的通道没配 |
+| 10 | `bsp_oled_init(&s_oled)` | 步骤 3 | GPIOB 时钟没开 → 屏幕无应答 |
+| 11 | `bsp_tick_init()` | 步骤 4 | 节拍不跑 |
+| 12 | `bsp_key_init()` | 步骤 3 **和** 11 | 无 tick：注册失败；无 GPIO：读到浮空电平，**开机会凭空多一次按下事件** |
+| 13 | `bsp_pot_init()` | 步骤 5 | 自校准要求 ADC 关闭（ADON=0），此刻正好满足 |
+| 14 | `bsp_serial_init()` | 步骤 6 | 武装接收中断时串口还没配好 |
+| 15 | `bsp_motor_init()` | 步骤 3 **和** 7 | 顺序有意排先：它把电机置为「停」，**越早做摆杆越安全** |
+| 16 | `bsp_encoder_init()` | 步骤 8 | 游标要对齐到当前 CNT |
+| 17 | `bsp_angle_init()` | 步骤 9 | 自校准同样要求 ADC 关闭 |
+| 18 | `bsp_tick_register(app_1ms_task)` | 步骤 11 | 注册编码器游标推进任务 |
 
-`bsp_tick_register()` 在步骤 8 之后随时可调，槽位上限见 2.1。
+`bsp_tick_register()` 在步骤 11 之后随时可调，槽位上限见 2.1（**当前已用 2 个：按键 + 编码器**）。
 
-> **唯一一条「顺序反了也返回成功、但行为是错的」是第 9 条**——其余顺序错了都会在 `_init` 返回错误码，能立刻看见。这也是它最值得记的原因。
+> **唯一一条「顺序反了也返回成功、但行为是错的」是第 12 条**——其余顺序错了都会在 `_init` 返回错误码，能立刻看见。这也是它最值得记的原因。
 
 ### 1.5 中断优先级
 
@@ -480,6 +503,137 @@ USART1，PA9 = TX / PA10 = RX，**115200-8-N-1**，无硬件流控。收发都�
 
 ---
 
+### 2.6 电机 —— [bsp/motor/bsp_motor.h](../bsp/motor/bsp_motor.h)
+
+TB6612FNG 的 A 路，驱动 25GA370 直流电机。**20 kHz PWM**（TIM2_CH1，PSC=35 / ARR=99）。
+
+| 功能 | 引脚 |
+| --- | --- |
+| PWM（速度） | **PA0** = TIM2_CH1 = PWMA |
+| 方向 | **PB12 / PB13** = AIN1 / AIN2 |
+| STBY | 板上直接接 3V3，**代码不用管** |
+
+```c
+#include "bsp_motor.h"
+```
+
+**常量**
+
+| 名称 | 值 | 说明 |
+| --- | --- | --- |
+| `BSP_MOTOR_DUTY_MAX` | 100 | duty 上限，同时也是 100% 占空比 |
+| `BSP_MOTOR_PWM_ARR` | 99 | **与 `.ioc` 里 TIM2 的 ARR 绑死**，改一处要改两处 |
+
+**接口**
+
+| 接口 | 签名 | 返回 | 说明 |
+| --- | --- | --- | --- |
+| 初始化 | `error_t bsp_motor_init(void)` | `ERR_OK` / `ERR_NOT_READY` | 方向脚置 0、CCR 置 0，**最后才** `HAL_TIM_PWM_Start()` |
+| 设转速 | `error_t bsp_motor_set_duty(int16_t duty)` | `ERR_OK` / `ERR_NOT_INITIALIZED` | −100~+100，**超出夹紧**（见下） |
+| 滑行 | `error_t bsp_motor_coast(void)` | 同上 | AIN1=AIN2=0，输出高阻，**惯性滑行** |
+| 刹车 | `error_t bsp_motor_brake(void)` | 同上 | AIN1=AIN2=1，绕组短接，**电磁刹车** |
+| 读回 | `int16_t bsp_motor_duty(void)` | −100~+100 | 读**夹紧后**的实际命令值 |
+
+**语义要点**
+
+- **duty 的量纲就是百分数**：因为 ARR=99，占空比 = `CCR/(ARR+1)` = `CCR/100`，所以 `duty` 直接当 CCR 写，无需换算。这个前提绑在 `BSP_MOTOR_PWM_ARR` 上。
+- **越界是夹紧，不返回错误**：调用者主要是 PID 控制环，其输出瞬态越界属正常现象；此时让电机**停摆**比夹紧到边界危险得多（倒立摆失去力矩会直接倒）。需要严格边界检查的场合请调用前自行判断。
+- **`coast()` 与 `set_duty(0)` 等价**（都是 AIN1=AIN2=0 + CCR=0），但**与 `brake()` 电气状态完全不同**——前者电机可自由转动，后者有明显阻力。调试时用手扭输出轴就能区分（见 [motor.md](motor.md#54-第三层方向一致性最要紧的一条)）。
+- **`init()` 里的顺序不能调换**：先写方向/CCR，最后 `HAL_TIM_PWM_Start()`，保证上电绝不带非零占空比。
+- ⚠️ `HAL_TIM_PWM_Start()` **必须显式调用且只能调一次**。`MX_TIM2_Init()` 只把参数写进寄存器，**不使能输出比较和计数器**——漏掉的现象是「编译烧录全成功、电机纹丝不动」。
+- ⚠️ **`duty > 0` 的方向与「编码器正计数」已经实测对齐**（见 2.7）。
+
+---
+
+### 2.7 编码器 —— [bsp/encoder/bsp_encoder.h](../bsp/encoder/bsp_encoder.h)
+
+TIM3 编码器模式，AB 正交**四倍频**。**408 边沿 / 输出轴圈**。
+
+| 功能 | 引脚 |
+| --- | --- |
+| A 相 | **PA6** = TIM3_CH1 = E1A |
+| B 相 | **PA7** = TIM3_CH2 = E1B |
+
+```c
+#include "bsp_encoder.h"
+```
+
+**常量**
+
+| 名称 | 值 | 说明 |
+| --- | --- | --- |
+| `BSP_ENCODER_EDGES_PER_REV` | 408 | 四倍频后，输出轴一圈的计数增量 |
+
+**接口**
+
+| 接口 | 签名 | 返回 | 说明 |
+| --- | --- | --- | --- |
+| 初始化 | `error_t bsp_encoder_init(void)` | `ERR_OK` / `ERR_NOT_READY` | 启动编码器接口 + **把游标对齐到当前 CNT** |
+| 采集 | `error_t bsp_encoder_update(void)` | `ERR_OK` / `ERR_NOT_INITIALIZED` | 推进游标、累加位置、记下本段增量 |
+| 位置 | `int32_t bsp_encoder_total(void)` | 累计边沿数 | 正负表示方向；未初始化返回 0 |
+| 速度 | `int16_t bsp_encoder_delta(void)` | 上次增量 | 除以 update 周期即转速 |
+| 清零 | `error_t bsp_encoder_reset(void)` | 同上 | **同时重新对齐游标** |
+| 反向 | `error_t bsp_encoder_set_invert(bool invert)` | 同上 | A/B 相接反时的软件兜底，**正常不用** |
+
+**语义要点**
+
+- **接口形状与 `bsp_pot` 一致**：`update()` 对应 `sample()`（采集，有副作用），`total()`/`delta()` 对应 `raw()`（取值，无副作用）。
+- ⚠️ **本模块不清零 CNT**，只维护软件游标，增量用**模 2^16 相减**：`(int16_t)(uint16_t)(now - last)`。好处是不丢边沿、采集时机任意、不需要关中断。**代价是 `reset()` 必须显式对齐游标**（否则清零后位置会凭空多出一截）。
+- ⚠️ **正确性前提**：两次 `update()` 之间的真实增量 \|d\| < 32768。408 边沿/圈、620 RPM 满速也只有约 4.2k 边沿/秒，**1 ms 采一次是 4 个边沿**，差三个数量级。
+- **方向由 `.ioc` 里的 IC1/IC2 极性决定**（当前 IC1=RISING、IC2=FALLING，与参考实现对齐）。`set_invert()` 只是兜底开关。
+- **本模块不需要注册节拍任务**（读一个寄存器而已）。当前工程为了显示节奏稳定，在 1 ms 节拍里调了一次 `update()`。
+- ⚠️ **电机正转（`duty > 0`）时 `total` 必须增大** —— 已实测确认。**这条错了双环 PID 会变成正反馈。**
+
+---
+
+### 2.8 角度传感器 —— [bsp/angle/bsp_angle.h](../bsp/angle/bsp_angle.h)
+
+倒立摆摆杆角度：**一只 360° 电位器**（不是 MPU6050/AS5600），走 **ADC1_IN8**。
+
+| 功能 | 引脚 |
+| --- | --- |
+| 角度信号 | **PB0** = ADC1_IN8 = SENSOR1 |
+
+```c
+#include "bsp_angle.h"
+```
+
+**常量**
+
+| 名称 | 值 | 说明 |
+| --- | --- | --- |
+| `BSP_ANGLE_RAW_MAX` | 4095 | 12 位 ADC 满量程 |
+| `BSP_ANGLE_VREF_MV` | 3300 | 参考电压 |
+
+**接口**
+
+| 接口 | 签名 | 返回 | 阻塞 | 前置条件 |
+| --- | --- | --- | --- | --- |
+| 初始化 | `error_t bsp_angle_init(void)` | `ERR_OK` / `ERR_NOT_READY` | 约 83 个 ADC 周期 | `MX_ADC1_Init()` 之后 |
+| 采样 | `error_t bsp_angle_sample(void)` | `ERR_OK` / `ERR_NOT_INITIALIZED` / `ERR_NOT_READY` / `ERR_TIMEOUT` | **约 5.7 µs** | `bsp_angle_init()` 之后 |
+| 原始值 | `uint16_t bsp_angle_raw(void)` | 0~4095 | 无 | — |
+| 电压 | `uint16_t bsp_angle_millivolt(void)` | 0~3300 mV | 无 | — |
+
+**语义要点**
+
+- ⚠️ **只能在主循环调用，不要放进中断**——它内部 `HAL_ADC_PollForConversion()` 的超时依赖 `HAL_GetTick()`，而 TIM1（优先级 1）高于 SysTick（15），进中断会**永久死等**。与 `bsp_pot_sample()` 同一条约束。
+- **不需要每次改通道**（只有一个固定通道，配置在 `MX_ADC1_Init()` 里定死），这点与 `bsp_pot` 不同。
+- ⚠️ **驱动层不提供「角度是多少度」**：竖直零点 `CENTER_ANGLE` 取决于机械安装相位，属应用层标定。PID 用 `raw - CENTER_ANGLE` 当误差即可，连「度」都不需要。
+- **有效角度 333°，两端约有 27° 盲区**，跨过去读数会突变。这是器件特性，**本模块不做补偿**——应用层应做范围检查（参考实现：超出中心 ±500 LSB 就停机）。
+- **本台设备的实测标定值**（写在 [main.c](../Core/Src/main.c) 的注释里）：
+
+  | 位置 | `raw` |
+  | --- | --- |
+  | 摆杆竖直（手扶，**有约 3° 误差**） | 2086 |
+  | 水平向左（逆时针 90°） | 960 |
+  | 水平向右（顺时针 90°） | 3160 |
+
+  由此得 **12.22 LSB/度**，满量程折算 335°（对上手册的 333°，差 0.6%）。读数随**顺时针转动而增大**。
+
+- ⚠️ **`CENTER_ANGLE` 不能用理想的 2048**。2048 是电位器的**电气中点**，与「摆杆竖直」没有物理必然联系——两者是否重合取决于机械安装。参考实现给的是**区间**（1900~2200）而非一个数，正说明它要被测出来。用错中心值会让摆杆稳态偏移、并总朝一个方向跑。**权威测法是让摆杆自由下垂停稳后读**（重力定义竖直，无手测误差）。
+
+---
+
 ## 三、调用上下文总表
 
 | 接口 | 主循环 | 1 ms 节拍任务 | 阻塞时长 | 备注 |
@@ -497,6 +651,13 @@ USART1，PA9 = TX / PA10 = RX，**115200-8-N-1**，无硬件流控。收发都�
 | `ssd1306_fill` / `draw_*` / `write_*` | ✅ | ❌ | 无 | 只改显存 |
 | `ssd1306_update_screen` | ✅ | ❌ | **约 30 ms** | 8 页 I2C 传输 |
 | `ssd1306_set_display_on` / `set_contrast` | ✅ | ❌ | 一个 I2C 帧 | 屏没应答会返回错误 |
+| `bsp_motor_set_duty` / `coast` / `brake` | ✅ | ✅（不推荐） | 无（几次寄存器写） | 纯寄存器操作，中断安全 |
+| `bsp_motor_duty` | ✅ | ✅ | 无 | 只读缓存 |
+| `bsp_encoder_update` | ✅ | ✅ | 无（读一个寄存器） | **本工程就是在 1 ms 节拍里调的** |
+| `bsp_encoder_total` / `delta` | ✅ | ✅ | 无 | 只读缓存 |
+| `bsp_encoder_reset` / `set_invert` | ✅ | ❌ | 无 | 会改模块状态，别在中断里做 |
+| `bsp_angle_sample` | ✅ | **❌** | 约 5.7 µs | 依赖 `HAL_GetTick`，中断里会死等（同 `bsp_pot_sample`） |
+| `bsp_angle_raw` / `millivolt` | ✅ | ✅ | 无 | 纯内存 |
 
 ---
 
@@ -506,60 +667,56 @@ USART1，PA9 = TX / PA10 = RX，**115200-8-N-1**，无硬件流控。收发都�
 
 ```c
 /* ── 文件级状态 ─────────────────────────────────────────── */
-static ssd1306_t         s_oled;
-static volatile uint32_t s_tick_count;          /* 1 ms 任务累加，主循环读 */
+static ssd1306_t s_oled;
 
-/* ── 1 ms 任务：只累加计数，别的都别干 ───────────────────── */
+/* ── 1 ms 任务：只做「读一个寄存器」，别的都别干 ─────────── */
 static void app_1ms_task(void)
 {
-    s_tick_count++;                             /* 32 位变量，单条指令，读写安全 */
+    (void)bsp_encoder_update();     /* 纯寄存器读，几十个周期 */
 }
 
 /* ── 初始化（顺序见 1.4）───────────────────────────────── */
-if (bsp_oled_init(&s_oled)             != ERR_OK) { app_fatal_blink(1U); }
-if (bsp_tick_init()                    != ERR_OK) { app_fatal_blink(2U); }
-if (bsp_key_init()                     != ERR_OK) { app_fatal_blink(3U); }
-if (bsp_pot_init()                     != ERR_OK) { app_fatal_blink(4U); }
-if (bsp_serial_init()                  != ERR_OK) { app_fatal_blink(5U); }
-if (bsp_tick_register(app_1ms_task)    != ERR_OK) { app_fatal_blink(6U); }  /* 还剩 2 个槽 */
+/* ... MX_xxx_Init() ... */
+if (bsp_oled_init(&s_oled)          != ERR_OK) { app_fatal_blink(1U); }
+if (bsp_tick_init()                 != ERR_OK) { app_fatal_blink(2U); }
+if (bsp_key_init()                  != ERR_OK) { app_fatal_blink(3U); }
+if (bsp_pot_init()                  != ERR_OK) { app_fatal_blink(4U); }
+if (bsp_serial_init()               != ERR_OK) { app_fatal_blink(5U); }
+if (bsp_motor_init()                != ERR_OK) { app_fatal_blink(6U); }  /* 先停机，最安全 */
+if (bsp_encoder_init()              != ERR_OK) { app_fatal_blink(7U); }
+if (bsp_angle_init()                != ERR_OK) { app_fatal_blink(8U); }
+if (bsp_tick_register(app_1ms_task) != ERR_OK) { app_fatal_blink(9U); }  /* 还剩 2 个槽 */
 
 /* ── 主循环：一律「查时间、时间到了才做」，不写 HAL_Delay ── */
 while (1)
 {
-    /* 1. 按键：必须 while 取干净 */
-    for (uint8_t i = 0U; i < (uint8_t)KEY_ID_COUNT; i++) {
-        key_event_t ev;
-        while ((ev = bsp_key_take_event((key_id_t)i)) != KEY_EVENT_NONE) {
-            if (ev == KEY_EVENT_PRESS) { app_on_key_press((key_id_t)i); }
-        }
-    }
+    app_handle_keys();      /* 按键：每个键都要 while 取干净 */
+    app_apply_motor();      /* 把运行状态/占空比落到电机（未运行则强制 coast） */
+    app_refresh_display();  /* 5 ms 采一次角度，值变化超过死区才整屏重画 */
 
-    /* 2. 电位器：20 ms 一次，失败则整批丢弃 */
-    static uint32_t last_pot_ms;
-    const uint32_t  now = HAL_GetTick();
-    if ((now - last_pot_ms) >= 20U) {
-        last_pot_ms = now;
-        if (bsp_pot_sample() == ERR_OK) {
-            app_pid_set_setpoint((int32_t)bsp_pot_raw(POT_ID_RP1));
-        }
-    }
-
-    /* 3. 串口：有多少取多少，喂给行解析器 */
-    app_serial_poll();
-
-    /* 4. OLED：按脏标记/死区刷，别每圈都刷 */
-    if (app_ui_dirty()) { app_ui_redraw(); }
+    /* 心跳 LED */
+    const uint32_t now_ms = HAL_GetTick();
+    if ((now_ms - last_led_ms) >= 500U) { last_led_ms = now_ms; /* toggle PC13 */ }
 }
 ```
+
+**主循环里没有 `HAL_Delay`**：在循环里死等会让所有周期性动作互相拖累
+（比如屏幕每 30 ms 刷一次，若用延时定时，角度采样周期就变成了「30 ms + 延时」）。
+一律用「查时间、时间到了才做」的非阻塞写法，真正的活由各自的时间条件把关。
 
 **PID 控制环放哪**——两个选择：
 
 | 方案 | 周期抖动 | 可用接口 |
 | --- | --- | --- |
-| 放 1 ms 节拍任务里 | 精确 | **只能**用第三节标「✅ 中断」的接口。`bsp_pot_raw()` 可以，`bsp_pot_sample()` **不行**（会死等） |
-| 放主循环按 `s_tick_count` 定时 | 受刷屏影响 | 全部可用 |
+| 放 1 ms 节拍任务里（内部再分频到 5 ms / 50 ms） | 精确 | **只能**用第三节标「✅ 中断」的接口。`bsp_encoder_total()`、`bsp_angle_raw()`、`bsp_motor_set_duty()` 都可以；`bsp_angle_sample()` / `bsp_pot_sample()` **不行**（会死等） |
+| 放主循环按时间戳定时 | 受刷屏影响 | 全部可用 |
 
-现阶段推荐后者：先把算法调通，再谈抖动。
+**关键约束**：角度采样只能在主循环做（见 2.8）。所以「控制环在中断里跑」
+这个方案要么接受角度值有最多一个主循环周期的延迟（在中断里读缓存、在主循环里更新缓存），
+要么先给 `bsp_angle` 加一对非阻塞接口（`trigger()` + `poll()`）。
+**现阶段推荐把控制环放主循环**：先把算法调通，再谈抖动。
+
+节拍槽位目前用了 2 个（按键 + 编码器），**还剩 2 个**给 PID 用。
 
 ---
 
@@ -581,3 +738,10 @@ while (1)
 12. **`bsp_pot_sample()` 失败时缓存是混合状态**——必须整批丢弃，不要用 `bsp_pot_raw()` 的值。
 13. **PB8/PB9 的电气参数配了两遍**（`.ioc` + `i2c_soft_init()`），改一处要改另一处。
 14. **OLED 的 `'\0'` 之外的不可显示字符会让字符串输出提前结束**，不是被跳过。
+15. **`HAL_TIM_PWM_Start()` 必须显式调用**——`MX_TIM2_Init()` 只写寄存器，不使能输出比较和计数器。漏掉的现象是「配置/编译/烧录全成功、电机纹丝不动」。且**只能调一次**，重复调用会因状态是 BUSY 而返回错误。
+16. **`HAL_TIM_Encoder_Start()` 必须传 `TIM_CHANNEL_ALL`**——传单个通道只使能一个 `CCxE`，四倍频会**静默少计一半**（编译运行都不报错）。
+17. **电机正转（`duty > 0`）必须对应编码器 `total` 增大**。这条错了双环 PID 会变成**正反馈**，现象是「参数怎么调都发散」。**必须用硬件实测确认，不能靠推导**——已实测通过。
+18. **编码器模式与输入捕获模式的参数键名不同**（`IC1Polarity` vs `ICPolarity_1`），**且合法取值是两套枚举**。写错时命令回 OK、roundtrip 也过，只有去生成的代码里数字段才能发现。
+19. **`bsp_encoder_reset()` 必须重新对齐软件游标**，只清 `s_total` 会让清零后的位置凭空多出一截。
+20. **`bsp_angle` 的 `CENTER_ANGLE` 不能用理想的 2048**——2048 是电位器电气中点，与「摆杆竖直」无关。用错会让摆杆稳态偏移并总朝一个方向跑。**权威测法是让摆杆自由下垂停稳后读**。
+21. **`bsp_motor_set_duty()` 越界是夹紧、不报错**（有意的设计取舍），调用者若依赖错误码做边界检查会落空。
