@@ -36,14 +36,36 @@
  *   1900~2200 之间）。
  * ────────────────────────────────────────────────────────────────────
  *
- * ── 使用方式 ────────────────────────────────────────────────────────
- *   在主循环里按周期采样（接口形状与 bsp_pot 一致）：
+ * ── 两套采样接口，用哪套取决于调用上下文 ────────────────────────────
  *
- *     if (bsp_angle_sample() == ERR_OK) {
- *         uint16_t a = bsp_angle_raw();      // 0~4095
- *     }
+ *   ① **主循环 / 测试用 —— 阻塞式**
  *
- *   **不要挂到 1 ms 节拍上**，理由与 bsp_pot 相同（见下）。
+ *        if (bsp_angle_sample() == ERR_OK) {
+ *            uint16_t a = bsp_angle_raw();      // 0~4095
+ *        }
+ *
+ *      触发一次、等到结果、返回，全程约 6 µs。顺带把上次的值刷新到
+ *      `bsp_angle_raw()`。
+ *
+ *   ② **中断 / 控制环用 —— 非阻塞式（分开的两步）**
+ *
+ *        bsp_angle_trigger();                    // 启动转换，立即返回
+ *        ...                                    // 干别的去
+ *        if (bsp_angle_poll() == ERR_OK) {       // 回来看看转完没有
+ *            uint16_t a = bsp_angle_raw();       // ERR_OK 才代表有新值
+ *        }
+ *
+ *      **拆成两步是必须的，不是风格问题**：一次转换要 5.7 µs，而 1 ms
+ *      控制节拍里有的是别的事可干；更关键的是 `bsp_angle_sample()` 内部
+ *      走 `HAL_ADC_Start()`，那里面有 `HAL_GetTick()` 的超时判断，
+ *      在 1 ms 中断里**会死等**（详见 `bsp_angle_sample()` 的说明）。
+ *      `trigger`/`poll` 里没有任何依赖 `HAL_GetTick()` 的调用，
+ *      整套是纯寄存器操作，**可以在任何优先级的中断里跑**。
+ *
+ *   ⚠️ 换句话说：**`bsp_angle_sample()` 不要挂到 1 ms 节拍上**
+ *      （理由与 bsp_pot 相同）；节拍里请用 ②。
+ *
+ *   两套接口共用同一份状态和同一个 `s_angle_raw`，可以混用。
  */
 
 #ifndef BSP_ANGLE_H
@@ -73,23 +95,61 @@
  *
  * @note 校准内部用到 HAL_GetTick()，所以本函数只能在初始化阶段
  *       （主线程）调用。
+ *
+ * @note **本函数把 ADC 永久打开，之后再也不关**（详见 .c 里的说明）。
+ *       这是刻意的：ADC 每次从关到开都要等一次 ADRDY 稳定时间，而
+ *       那段等待在 HAL 里靠 HAL_GetTick()，中断里没法用。
  */
 error_t bsp_angle_init(void);
 
 /**
- * @brief 触发一次转换并读回结果。
+ * @brief 【非阻塞 · 第一步】启动一次转换，立即返回。
+ *
+ * @return error_t ERR_OK 已启动；ERR_NOT_INITIALIZED 未初始化
+ *
+ * @note 纯寄存器写（置 `CR2` 的 `SWSTART`），耗时几十纳秒，**中断安全**。
+ *
+ * @note 调用之后要过约 5.7 µs 结果才就绪，用 `bsp_angle_poll()` 取。
+ *
+ * @note 重复调用（上次结果还没取走）不会出错：上一次的转换结果会被
+ *       丢弃，从这一次重新算起。控制环每个周期都会先取再触发，
+ *       正常不会走到这条路径。
+ */
+error_t bsp_angle_trigger(void);
+
+/**
+ * @brief 【非阻塞 · 第二步】看看上次 trigger 的转换转完没有。
+ *
+ * @return error_t ERR_OK = 转完了，值已更新到 `bsp_angle_raw()`；
+ *                 ERR_NOT_READY = 还没转完（或没 trigger 过）；
+ *                 ERR_NOT_INITIALIZED = 未初始化
+ *
+ * @note 一次转换只报告一次 `ERR_OK`。取走后再调还是 `ERR_NOT_READY`，
+ *       直到下一次 `bsp_angle_trigger()` —— 这样「ERR_OK」就等价于
+ *       「拿到一个新的采样」，而不是「读到一个可能很旧的值」。
+ *       控制环靠这个语义判断数据是否新鲜。
+ *
+ * @note **中断安全**：只读 `SR` 与 `DR` 两个寄存器，不碰 HAL_GetTick。
+ */
+error_t bsp_angle_poll(void);
+
+/**
+ * @brief 【阻塞】触发一次转换、等到结果、返回。`trigger` + `poll` 的包装。
  *
  * @return error_t ERR_OK 成功；ERR_NOT_INITIALIZED 未初始化；
- *                 ERR_NOT_READY ADC 启动失败；ERR_TIMEOUT 等待超时
+ *                 ERR_TIMEOUT 等超时（有界自旋耗尽）
  *
- * @note 阻塞约 5.7 µs（(55.5 + 12.5) 个 ADC 周期 @ 12 MHz）。
+ * @note 正常耗时约 6 µs（(55.5 + 12.5) 个 ADC 周期 @ 12 MHz）。
  *
- * @note ⚠️ **只能在主循环里调用，不要放进中断。**
- *       它内部用 HAL_ADC_PollForConversion()，该函数的超时判断依赖
- *       HAL_GetTick()；而 1 ms 节拍所在的 TIM1 抢占优先级（1）高于
- *       SysTick（15），在节拍任务里 uwTick 根本不涨——一旦这次转换
- *       没有正常完成，等待会**永久卡死**，整个系统从此失去节拍。
- *       这与 bsp_pot_sample() 是同一条约束。
+ * @note ⚠️ **只能在主循环里调用，不要放进中断。** 不是因为等待方式
+ *       （它是有界自旋，不依赖 HAL_GetTick），而是因为**它要花 6 µs
+ *       干等**——放在 1 ms 节拍里等于白占 0.6% 的 CPU，还没给控制环
+ *       留下「转换期间去干别的」的机会。中断里请用 trigger/poll 两步式。
+ *
+ * @note 超时不是死等：自旋次数有上限（`BSP_ANGLE_SPIN_LIMIT`），
+ *       耗尽就返回 ERR_TIMEOUT。这比原实现更安全——原实现依赖
+ *       HAL_GetTick()，而 TIM1 节拍的抢占优先级（1）高于 SysTick（15），
+ *       在节拍里 uwTick 根本不涨，真正的故障会**永久卡死**。
  */
 error_t bsp_angle_sample(void);
 
