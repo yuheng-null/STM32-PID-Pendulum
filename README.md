@@ -23,6 +23,10 @@
 
 倒立摆本体的机械、传感器、执行器部分**尚未开始**，后续按教程推进。
 
+> 📖 **接口速查见 [docs/api.md](docs/api.md)** —— 每个模块向应用层暴露了哪些函数、什么前置条件、
+> 能不能在中断里调、值域是多少，含一张「调用上下文总表」和主循环最小骨架。
+> **写代码时查它，理解原理时看各模块的 `docs/*.md` 详解。**
+
 ---
 
 ## 硬件平台
@@ -144,7 +148,7 @@ HAL        Drivers/           ST 的 HAL 与 CMSIS
 │   ├── common/error.h          统一错误码 error_t
 │   ├── bus/i2c/                软件模拟 I2C 总线
 │   └── device/ssd1306/         SSD1306 器件驱动 + 字库
-├── docs/                       模块实现详解（oled.md / key.md / pot.md / serial.md）
+├── docs/                       模块详解（oled.md / key.md / pot.md / serial.md）+ 接口速查（api.md）
 ├── Drivers/
 │   ├── CMSIS/                  ARM CMSIS 内核与设备头文件（第三方，Apache-2.0）
 │   └── STM32F1xx_HAL_Driver/   ST HAL 驱动（第三方，BSD-3-Clause）
