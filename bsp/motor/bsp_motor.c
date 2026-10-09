@@ -46,7 +46,7 @@ static void motor_set_dir(GPIO_PinState ain1, GPIO_PinState ain2)
     HAL_GPIO_WritePin(MOTOR_AIN2_GPIO_Port, MOTOR_AIN2_Pin, ain2);
 }
 
-/** 直接写比较值（即占空比，量纲 0~100） */
+/** 直接写比较值（即占空比，量纲 0~BSP_MOTOR_DUTY_MAX，1800 = 100%） */
 static void motor_set_ccr(uint16_t ccr)
 {
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, ccr);

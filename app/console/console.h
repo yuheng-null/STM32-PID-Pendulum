@@ -32,7 +32,7 @@
  *   HELP                              OK CMD=.. PARAM=..
  *   （任何无法识别的输入）             ERR <原因>
  *
- *   参数名（共 9 个）：AKP AKI AKD PKP PKI PKD CENTER RANGE OFFSET
+ *   参数名（共 10 个）：AKP AKI AKD PKP PKI PKD CENTER RANGE START OFFSET
  *   （A*=角度环/内环，P*=位置环/外环，见 control.h）
  *
  * ── 为什么是 ASCII 明文，而不是二进制帧 ────────────────────────────

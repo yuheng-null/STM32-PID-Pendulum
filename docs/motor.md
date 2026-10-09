@@ -15,7 +15,7 @@ PWM 频率为什么选 20 kHz、初始化顺序为什么不能调换，以及怎
 | [Core/Src/stm32f1xx_hal_msp.c](../Core/Src/stm32f1xx_hal_msp.c) | CubeMX 生成 | TIM2 时钟使能、**PA0 配成复用推挽** |
 | [Core/Inc/main.h](../Core/Inc/main.h) | CubeMX 生成 | `MOTOR_AIN1_Pin` / `MOTOR_AIN2_Pin` 宏 |
 | [bsp/motor/bsp_motor.h](../bsp/motor/bsp_motor.h) · [.c](../bsp/motor/bsp_motor.c) | BSP | 占空比/方向映射、两种停机语义 |
-| [Core/Src/main.c](../Core/Src/main.c) | 应用 | 按键控制启停与占空比 |
+| [app/control/control.c](../app/control/control.c) | 应用 | 双环 PID 算出占空比；按键只负责启停与位置目标 |
 
 ---
 
@@ -47,7 +47,7 @@ PWM 频率为什么选 20 kHz、初始化顺序为什么不能调换，以及怎
 | 怎么确认的？ | 逐脚读套件原理图 `PID电机驱动及控制板-V1.0.pdf`，并用 CubeMX 的 F103 设备 XML 核对引脚复用能力 |
 | 需要几个信号？ | 2 个方向脚 + 1 路 PWM |
 | STBY 引脚要管吗？ | **不用** —— 板上直接接了 3V3，芯片常使能 |
-| 占空比给多少档？ | 0~100%，直接当 CCR 用（见 4.2） |
+| 占空比给多少档？ | 0~1800（**CCR 原始值**，1800 = 100%），分辨率 0.056%（见 2.3 / 4.2） |
 
 关于**引脚是怎么确定的**，值得单独说一句，因为这里是本项目第一次出现"同一根线有两个可能角色"的情况：
 
@@ -103,7 +103,7 @@ PWM 斩波的思路：把电源以固定频率在"接通/断开"之间切换，*
         ──────┘
 ```
 
-本模块的 `duty` 就是这个占空比的百分数。
+本模块的 `duty` 是**写进 CCR 的原始值**：1800 对应 100% 占空比（不是 100）。
 
 ### 2.2 H 桥与 TB6612 的四态真值表
 
@@ -152,18 +152,37 @@ TIM2 挂在 APB1 上。APB1 预分频 = 2，而 STM32 的规则是
 「APB 预分频大于 1 时，定时器时钟 = 2 × PCLKx」：
 
     72 000 000 Hz ÷ (PSC+1) ÷ (ARR+1)
-  = 72 000 000    ÷   36    ÷   100     = 20 000 Hz = 20 kHz
+  = 72 000 000    ÷    2    ÷   1800    = 20 000 Hz = 20 kHz
 
-  → PSC = 35（写 36-1）   ARR = 99（写 100-1）
+  → PSC = 1（写 2-1）   ARR = 1799（写 1800-1）
 ```
 
-> **ARR 为什么是 100-1**：计数器从 0 数到 ARR，数 `ARR+1` 个数。
+> **ARR 为什么是 1800-1**：计数器从 0 数到 ARR，数 `ARR+1` 个数。
 > 少减这个 1 是最常见的低级错误（和 [bsp_tick.c](../bsp/tick/bsp_tick.c) 里
 > TIM1 的 `Period = 999` 是同一条）。
 
-**顺带一个好处**：ARR = 99 时，占空比 = `CCR / (ARR+1)` = `CCR / 100`。
-也就是说 **CCR 的数值直接就是百分比**，`duty = 50` 对应 50% 占空比，
-不需要任何换算系数。这是本模块接口设计得这么简洁的前提。
+**为什么不用更常见的 ARR = 99**：两种配法都是 20 kHz，但**占空比分辨率差 18 倍**：
+
+| 配法 | PSC / ARR | 分辨率 |
+| --- | --- | --- |
+| 常见配法 | 35 / 99 | 1/100 = **1%** |
+| 本工程 | 1 / 1799 | 1/1800 = **0.056%** |
+
+控制环在平衡点附近只输出零点几个百分点，1% 的步长会让电机在正反 1% 之间来回跳
+（量化抖动），0.056% 才够细腻。
+
+⚠️ **代价：参考工程的 PID 增益不能照抄，要乘以 18。**
+参考工程（15-倒立摆、00-PID综合测试程序 Mode3）的 PWM 时基是 ARR=99，
+满量程 100 个计数；本工程是 1800。真正决定物理强度的是**占空比**，不是裸计数：
+
+```
+参考：duty = Kp_ref × e / 100
+本机：duty = Kp_ours × e / 1800
+两者 duty 相同  ⟹  Kp_ours = Kp_ref × 18
+```
+
+`control.c` 里的默认增益已经按 ×18 换算过。照抄参考的 0.25 会得到一个**弱 18 倍**的
+控制器，摆杆立不住，而且很容易误判成「参考参数是错的」。
 
 ---
 
@@ -183,6 +202,17 @@ set pin PA0-WKUP TIM2_CH1
 set ip parameters TIM2 Prescaler 35
 set ip parameters TIM2 Period 99
 ```
+
+**第二步：为了分辨率只改时基两个数**（`mx.scratch/recipe_tim2_res.txt`）。
+频率不变（仍是 20 kHz），占空比分辨率从 1% 提到 0.056%：
+
+```text
+set ip parameters TIM2 Prescaler 1
+set ip parameters TIM2 Period 1799
+```
+
+> 注意这是**改已有外设的参数**，不是加外设——`TIM2` 已经在第一步里被激活过了。
+> 手改 `.ioc` 加外设会被 CubeMX 静默丢弃，但改参数走 `set ip parameters` 是正路。
 
 **第二步配方**：加入 PB12/PB13（`mx.scratch/recipe_tim3_c.txt` 的后半段）：
 
@@ -219,9 +249,9 @@ STM32F103 上 PA0 的规范名带后缀（它是唤醒引脚），类似地 `PC1
 
 ```c
 htim2.Instance = TIM2;
-htim2.Init.Prescaler = 35;
+htim2.Init.Prescaler = 1;
 htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-htim2.Init.Period = 99;
+htim2.Init.Period = 1799;
 htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
 htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
 if (HAL_TIM_PWM_Init(&htim2) != HAL_OK) { Error_Handler(); }
@@ -339,7 +369,7 @@ TIM2.IPParameters=Channel-PWM Generation1 CH1,Prescaler,Period   # 白名单：�
 
 ```c
 error_t bsp_motor_init(void);
-error_t bsp_motor_set_duty(int16_t duty);   /* -100 ~ +100 */
+error_t bsp_motor_set_duty(int16_t duty);   /* ±1800 */
 error_t bsp_motor_coast(void);
 error_t bsp_motor_brake(void);
 int16_t bsp_motor_duty(void);
@@ -350,26 +380,29 @@ int16_t bsp_motor_duty(void);
 | 决定 | 理由 |
 | --- | --- |
 | 用 `int16_t` 而不是 `uint8_t` + 单独的 dir 引脚 | **把方向和速度合成一个数**，控制环输出直接就是它，不用先判断符号再分别设两个参数。PID 的输出天然是带符号的 |
-| 量纲是「百分点」而不是原始 CCR | 因为 ARR=99，两者数值恰好相同（见 2.3），所以取更有物理意义的那个 |
+| 量纲是**原始 CCR 值**（量程 `±BSP_MOTOR_DUTY_MAX`）而不是百分点 | duty 直接写进 CCR，中间不做换算就没有取整误差；「1800 是满量程」这件事由 `BSP_MOTOR_DUTY_MAX` 一个常量记住（见 2.3 / 4.2） |
 | 有 `coast()` 和 `brake()` 两个停机接口 | 两者电气状态完全不同（见 2.2），混用会出问题 |
 | `bsp_motor_duty()` 返回**夹紧后**的值 | 显示和诊断需要知道"电机实际收到的命令"，而不是"应用想要的" |
 
 ### 4.2 为什么 duty 直接就是 CCR
 
 ```c
+/* duty > 0 走这一支；duty < 0 时方向脚对调、CCR 取 -duty */
 __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, (uint16_t)duty);
 ```
 
 这行看起来太简单了，值得解释为什么**不需要换算**：
 
 - 占空比 = `CCR / (ARR+1)`
-- 本工程 `ARR = 99`，所以 `ARR+1 = 100`
-- 于是占空比 = `CCR / 100` = **CCR 的百分数表示**
+- 本工程 `ARR = 1799`，所以 `ARR+1 = 1800`
+- 于是占空比 = `CCR / 1800`，即 **`duty` 就是写进 CCR 的原始值**，1800 = 100%
 
-**这是一个刻意选的巧合**，不是巧合——如果 ARR 取 999，`duty` 到 CCR 就要乘 10；
-如果取任意值 `N`，就得 `CCR = duty * (N+1) / 100`，多一次乘除、多一处取整误差、多一个可能写错的地方。
+**刻意不做「百分点」换算**：如果接口收的是百分数，每次都要算
+`CCR = duty × 1800 / 100`——多一次乘除、多一处取整误差、多一个可能写错的地方，
+而且那个 1800 还得跟着 ARR 一起改。让调用者直接给 CCR，这一层换算就不存在了。
 
-代价是 ARR 被绑死在 99。所以头文件里专门写了：
+代价是**「1800 是满量程」这件事要有人记住**，而且必须和 `.ioc` 里的 ARR 绑死。
+所以头文件里写了：
 
 ```c
 #define BSP_MOTOR_PWM_ARR       (BSP_MOTOR_DUTY_MAX - 1)
@@ -499,7 +532,7 @@ grep -n "TIM2 GPIO Configuration" -A 6 Core/Src/stm32f1xx_hal_msp.c
 
 要看到：
 
-- `htim2.Init.Prescaler = 35;` / `htim2.Init.Period = 99;` —— 20 kHz 的两个因子
+- `htim2.Init.Prescaler = 1;` / `htim2.Init.Period = 1799;` —— 20 kHz 的两个因子，也是 0.056% 分辨率的来源
 - `HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1)` —— 通道确实配了
 - MSP 里 `PA0-WKUP ------> TIM2_CH1` 且 `GPIO_MODE_AF_PP`
 
@@ -507,34 +540,35 @@ grep -n "TIM2 GPIO Configuration" -A 6 Core/Src/stm32f1xx_hal_msp.c
 
 ### 5.3 第二层：读运行时变量（不需要人动手）
 
-用 SWD **不复位**连接读 RAM，能拿到程序里的真值：
+两条路，**优先用串口**——它不受符号地址变化的影响：
+
+```bash
+# 串口控制台（协议见 api.md 的 app/console），一次拿到角度/位置/两环输出/最终 PWM
+STAT
+# OK ANGLE=2086 POS=-11397 SPD=0 ATAR=2086.000 AOUT=0.000 POUT=0.000 PWM=0 RUN=0
+```
+
+用 SWD 直接读 RAM 也行（`mode=hotplug` 是**不复位**连接，读到的是正在运行的实时值）：
 
 ```bash
 B="/c/Users/0isno/AppData/Local/stm32cube/bundles"
 export PATH="$B/gnu-tools-for-stm32/14.3.1+st.2/bin:$PATH"
 
-arm-none-eabi-nm build/Debug/PID_Pendulum.elf | grep -E "s_duty|s_duty_cmd|s_run"
-# 20000856 b s_duty          ← 驱动层实际写的占空比
-# 200005cc b s_duty_cmd      ← 应用层命令的占空比
-# 200005ce b s_run           ← 应用层运行状态
+arm-none-eabi-nm build/Debug/PID_Pendulum.elf | grep -E "s_duty|s_state"
+# 20000846 b s_duty      ← 驱动层实际写到电机的占空比
+# 20000859 b s_state     ← 控制状态机（0=STOP，1=RUN）
 
 CLI="$B/programmer/2.23.0/bin/STM32_Programmer_CLI.exe"
-"$CLI" -c port=SWD mode=hotplug -r16 0x20000856 2
+"$CLI" -c port=SWD mode=hotplug -r16 0x20000846 2
 ```
 
-`mode=hotplug` 是**不复位**连接，读到的是正在运行的程序的实时值。
+> ⚠️ **符号地址每次重新编译都会变**——上面这两行只是当前这次构建的值，
+> 用之前先跑一遍 `nm`。这正是「优先用串口」的原因。
 
 这里能验证一件**只在代码里看不出来的事**——"停机时电机真的被强制成 0"：
-
-```
-    时刻  angle  delta   total  duty   cmd run
-   0.6   1168      0  -11397     0   -10 off     ← 命令行是 -10，实际占空比是 0
-   1.2   1172      0  -11397     0   -10 off
-```
-
-`cmd = -10` 而 `duty = 0`、`run = off`：说明"未运行时强制滑行"这条逻辑生效了
-（`app_apply_motor()` 里 `if (s_run) set_duty(...) else coast()`）。
-这正是当初把 `s_duty_cmd`（命令值）和 `s_duty`（实际值）分开的目的。
+`control_tick()` 每 1 ms 都会在非 RUN 状态下调一次 `bsp_motor_coast()`，
+所以停机（含倒下保护自动停机）后即使有别的地方动过电机，下一拍也会被拉回来，
+`STAT` 里 `PWM` 恒为 0。
 
 > **踩过的坑（本机真实发生）**：一开始用 `sed` 从 CLI 输出里抓读数，
 > 结果抓到的是 ST-LINK 序列号里的 `37FF`（读出来 14335，**超过 12 位 ADC 的量程上限**，
@@ -552,35 +586,43 @@ CLI="$B/programmer/2.23.0/bin/STM32_Programmer_CLI.exe"
 
 **方法**：给一个固定正占空比，读编码器累计位置，看它增大还是减小。
 
-```bash
-# 操作：K2 ×3（命令行 20）→ K1 启动 → 等约 1 秒 → K1 停止
-python mx.scratch/pend_watch.py 6
-```
+> ⚠️ **这个方法依赖「能直接命令占空比」的调试路径。** 本工程当时的固件里
+> K2/K3 就是「直接加减电机占空比」，所以能这么测；**后来按键语义改成了
+> 调位置目标**（官方那套：K1 启停、K2/K3 目标 ±408、K4 清零），
+> 当前固件**没有**从外部直接给占空比的入口。要复测得临时加一段固定占空比的
+> 调试代码，或直接用调试器改写。
 
-实测结果（`s_total` 单调递增）：
+当时的实测结果（`s_total` 单调递增）：
 
-| 时刻 (s) | 时刻 | s_total | 增量 |
-| --- | --- | --- | --- |
-| 0.6 | | 685 | |
-| 1.2 | | 1107 | +422 |
-| 2.4 | | 1921 | |
-| 3.6 | | 2712 | |
-| 4.1 | | 3105 | **+393 / 0.5 s** |
+| 时刻 (s) | s_total | 增量 |
+| --- | --- | --- |
+| 0.6 | 685 | |
+| 1.2 | 1107 | +422 |
+| 2.4 | 1921 | |
+| 3.6 | 2712 | |
+| 4.1 | 3105 | **+393 / 0.5 s** |
 
-`duty = +20` → `s_total` **增大** → **方向一致** ✅
+`duty = +20`（**当时量程是 ±100**，即 20% 占空比；换算到现在的量程是 `duty = 360`）
+→ `s_total` **增大** → **方向一致** ✅
 
 再用负占空比测一遍**代码里另一条分支**（`duty < 0` 时的方向脚对调）：
 
 | | 基线 | 测试后 | 变化 |
 | --- | --- | --- | --- |
 | `s_total` | 28235 | **26252** | **−1983** |
-| `s_duty_cmd` | +20 | **−20** | |
+| 命令占空比 | +20 | **−20** | |
 
 `duty = −20` → `s_total` 减小 → **负分支也正确** ✅
 
 > ⚠️ 这一步**必须两个方向都测**：正负分支走的是**不同的代码路径**
 > （`motor_set_dir(AIN1, AIN2)` 与 `motor_set_dir(AIN2, AIN1)`），
 > 只测一个方向，另一条分支可能是错的而你不知道。
+
+**现在怎么复核方向**：在**系统层面**看——`RUN` 之后轻推摆杆偏离竖直，
+若电机把它往中心扶回去（而不是越推越远），说明整个串级是负反馈。
+本工程已人工确认过这一条。若哪天发现摆杆越跑越远，**第一个要怀疑的是
+`control.c` 里 `AnglePID.Target = CENTER − LocationPID.Out` 那个负号**，
+而不是去乱调增益（见 [control.h](../app/control/control.h)）。
 
 ### 5.5 第四层：用转速反推占空比映射
 
@@ -593,6 +635,7 @@ python mx.scratch/pend_watch.py 6
       → 116 RPM
 
 理论：25GA370 空载 620 RPM × 20% 占空比 = 124 RPM
+      （20% 对应当时的 duty=20；换算到当前量程是 duty=360）
 ```
 
 **116 对 124，约 94%**。偏差来自有刷电机的摩擦和内阻（空载转速本身就带负载），
@@ -608,7 +651,7 @@ python mx.scratch/pend_watch.py 6
 
 **PWM 频率 20 kHz 本身没有实测**（本机没有示波器/逻辑分析仪）。依据是：
 
-- 生成代码里 `PSC=35 / ARR=99` 正确
+- 生成代码里 `PSC=1 / ARR=1799` 正确
 - 实测转速与理论相符（若频率错到影响电机，转速会明显偏离）
 
 要坐实需要**测 PA0 引脚**（示波器看周期，或逻辑分析仪）。这是本模块唯一
@@ -621,14 +664,14 @@ python mx.scratch/pend_watch.py 6
 | 决定 | 换来什么 | 代价 |
 | --- | --- | --- |
 | 整个模块放 BSP，不拆器件层 | 接口简洁、不用为 3 个信号造抽象 | 换驱动芯片（如 DRV8833）时要改这个模块而不是新增一个 |
-| ARR = 99，duty 直接当 CCR | 占空比数值 = 百分数，无换算、无取整误差 | ARR 被绑死在 `.ioc` 与宏之间，改一处要改两处 |
+| duty 直接当 CCR（量程 ±1800） | 无换算、无取整误差；分辨率 0.056%，够控制环用 | 量程 1800 要有人记住，且 ARR 被绑死在 `.ioc` 与宏之间；参考工程的增益要 ×18 才能照抄 |
 | 20 kHz | 无啸叫、低速转矩平滑 | 比 1 kHz 稍多的开关损耗（对本应用无所谓） |
 | 越界夹紧不报错 | 控制环瞬态越界时电机不停摆 | 调用者拿不到"参数错了"的信号，必须自己保证范围 |
 | 区分 coast / brake | 两种停机语义各自明确 | 多一个接口，使用者要理解区别 |
 | `init()` 最后才 `Start` | 上电绝不带非零占空比 | 多两行、且顺序不能调换（要写注释说明） |
 | 方向脚交给 CubeMX 管 | 引脚冲突在配置阶段就被发现 | 改方向脚要重新生成代码，不能在代码里改 |
 
-整个模块约 170 行，其中真正的"逻辑"只有 `set_duty` 里那十行分支，
+整个模块约 150 行，其中真正的"逻辑"只有 `set_duty` 里那十行分支，
 其余都是**为安全付出的成本**——初始状态、夹紧、两种停机、`s_ready` 守卫。
 
 ---
