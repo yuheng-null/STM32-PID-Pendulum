@@ -841,9 +841,9 @@ AnglePID.Target = CENTER − LocationPID.Out     ← 外环去挪内环的目标
 ```
 ┌────────────────────────────┐
 │ Pendulum              RUN  │
-│ AKP   4.50   PKP   9.36    │  ← 两个环的增益（串口改的就是这几项）
-│ AKI   0.16   PKI   0.18    │
-│ AKD   7.38   PKD  82.08    │
+│ AKP   4.50   PKP   0.52    │  ← 两个环的增益（串口改的就是这几项）
+│ AKI   0.16   PKI   0.01    │
+│ AKD  12.00   PKD   4.56    │
 │ Ang   2086   Loc      0    │  ← 摆杆角度 / 横杆累计位置
 │ ATr   2086   LTr      0    │  ← 两环的目标值
 │ AOu    123   POu   0.00    │  ← 两环的输出
