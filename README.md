@@ -28,10 +28,14 @@
 - **串口调参控制台（`app/console`）** —— ASCII 行协议，供 agent 经串口在线改增益、看状态、串流数据
 - **自动启摆（`app/control` 的 `SWING_UP` 状态）** —— 不用手扶，机构自己把摆杆荡起来再交给双环
 
-**倒立摆的三个执行/传感驱动、双环 PID 的代码骨架都已在真硬件上验证**
-（串口协议 30 项断言全过、STREAM 50.0 行/秒零空洞、倒下保护自动停机、
-零增益 RUN 电机不动、串级方向确认为负反馈）。
-**本轮只搭结构，增益尚未整定**——调参是下一阶段的任务。
+**倒立摆已经能自己启摆、自己立住。** 平衡时角度偏差中位 **约 0.4~0.8°**，
+稳态从不打到 PWM 限幅，连续运行 20 秒以上不倒；启摆接住约 0.7 s。
+
+🎬 **[演示视频](docs/media/inverted-pendulum-demo.mp4)**
+
+真机上验证过的：串口协议 30+ 项断言全过、STREAM 50.0 行/秒零空洞、
+倒下保护自动停机、零增益 RUN 电机不动、串级方向确认为负反馈、
+自启摆与平衡（见 [docs/tuning.md](docs/tuning.md) 的实测数据）。
 
 > 当前屏幕上显示的是**双列调参界面**（左列角度环、右列位置环），
 > 不再是最早那些单模块验证界面。
@@ -42,6 +46,9 @@
 > **写代码时查它；理解原理时看各模块的详解**：[oled.md](docs/oled.md) ·
 > [key.md](docs/key.md) · [pot.md](docs/pot.md) · [serial.md](docs/serial.md) ·
 > [motor.md](docs/motor.md) · [encoder.md](docs/encoder.md) · [angle.md](docs/angle.md)
+>
+> 🎯 **整定 PID 的过程见 [docs/tuning.md](docs/tuning.md)** —— 用了什么方法、
+> 量到了什么数、修掉了哪两个 bug，以及几条只有在真机上才学得到的教训。
 
 ---
 
@@ -131,7 +138,7 @@ Flash latency: 2 WS
 
 ### 资源占用
 
-Debug 构建下：FLASH 38188 B / 64 KB（58.27%），RAM 3928 B / 20 KB（19.18%）。
+Debug 构建下：FLASH 39864 B / 64 KB（60.83%），RAM 3960 B / 20 KB（19.34%）。
 
 其中：
 
@@ -139,8 +146,8 @@ Debug 构建下：FLASH 38188 B / 64 KB（58.27%），RAM 3928 B / 20 KB（19.18
   和 +1 KB RAM（两个 256 字节环形缓冲 + HAL 句柄）
 - **倒立摆三件套**（电机 / 编码器 / 角度传感器）贡献约 +2.5 KB Flash
   （TIM2/TIM3/ADC1 的 HAL 模块代码），RAM 几乎不变
-- 从最初那份 29720 B 到现在，**新增的双环 PID + 串口控制台贡献了余下的约 8.5 KB**
-  （`algorithm/`、`app/` 两个模块的代码）
+- 从最初那份 29720 B 到现在，**新增的双环 PID + 串口控制台 + 自动启摆贡献了余下的
+  约 10 KB**（`algorithm/`、`app/` 两个模块的代码）
 
 > 注意：早先把测试程序从「电位器显示」换成「倒立摆驱动验证」时，
 > **Flash 反而降了 2.4 KB** —— 因为新程序不再调用 `printf`，
@@ -214,7 +221,10 @@ HAL        Drivers/           ST 的 HAL 与 CMSIS
 │   ├── common/error.h          统一错误码 error_t
 │   ├── bus/i2c/                软件模拟 I2C 总线
 │   └── device/ssd1306/         SSD1306 器件驱动 + 字库
-├── docs/                       接口速查（api.md）+ 模块详解（oled / key / pot / serial / motor / encoder / angle）
+├── docs/                       接口速查（api.md）+ 模块详解（oled / key / pot / serial /
+│   │                           motor / encoder / angle）+ 整定过程（tuning.md）
+│   └── media/                  演示视频
+├── tools/                      上位机脚本（协议回归、调参试验、启摆观测），不参与构建
 ├── Drivers/
 │   ├── CMSIS/                  ARM CMSIS 内核与设备头文件（第三方，Apache-2.0）
 │   └── STM32F1xx_HAL_Driver/   ST HAL 驱动（第三方，BSD-3-Clause）
@@ -799,9 +809,13 @@ AnglePID.Target = CENTER − LocationPID.Out     ← 外环去挪内环的目标
 
 | | 参考（Mode3） | 本工程默认 | 换算 |
 | --- | --- | --- | --- |
-| 角度环 | 0.25 / 0.009 / 0.41 | 4.50 / 0.162 / 7.38 | **× 18** |
+| 角度环 `Kp` / `Ki` | 0.25 / 0.009 | 4.50 / 0.162 | **× 18** |
+| 角度环 `Kd` | 0.41 | **12.0** | ×18 得 7.38，**又实测调到 12.0** |
 | 位置环 | 0.52 / 0.01 / 4.56 | 0.52 / 0.01 / 4.56 | **原值，不乘** |
-| `OFFSET` | 5 | 90 | × 18 |
+| `OFFSET` | 5 | **30**（×18 得 90） | 实测 90 偏大，见 [tuning.md](docs/tuning.md) |
+
+> 标着"实测"的两个值是在真机上扫出来的，完整数据、方法、以及踩到的坑
+> 见 **[docs/tuning.md](docs/tuning.md)**。
 
 **为什么位置环不乘**：它的输出**不喂 PWM**，而是加在内环的**角度目标**上，单位是 ADC 码。
 官方的位置环输出限幅也是 ±100 码 —— 两边单位相同、量程相同，增益原样照抄。
