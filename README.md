@@ -31,7 +31,7 @@
 **倒立摆已经能自己启摆、自己立住。** 平衡时角度偏差中位 **约 0.4~0.8°**，
 稳态从不打到 PWM 限幅，连续运行 20 秒以上不倒；启摆接住约 0.7 s。
 
-🎬 **[演示视频](docs/media/inverted-pendulum-demo.mp4)**
+🎬 演示视频：[docs/media/inverted-pendulum-demo.mp4](docs/media/inverted-pendulum-demo.mp4)
 
 真机上验证过的：串口协议 30+ 项断言全过、STREAM 50.0 行/秒零空洞、
 倒下保护自动停机、零增益 RUN 电机不动、串级方向确认为负反馈、
