@@ -58,6 +58,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/key/bsp_key.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/pot/bsp_pot.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/serial/bsp_serial.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/motor/bsp_motor.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/encoder/bsp_encoder.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/angle/bsp_angle.c
 )
 
 # Add include paths
@@ -70,6 +73,9 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/key
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/pot
     ${CMAKE_CURRENT_SOURCE_DIR}/bsp/serial
+    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/motor
+    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/encoder
+    ${CMAKE_CURRENT_SOURCE_DIR}/bsp/angle
 )
 
 # Add project symbols (macros)
