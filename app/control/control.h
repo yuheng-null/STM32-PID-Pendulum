@@ -314,17 +314,21 @@ error_t control_start(void);
 /**
  * @brief 启动控制，**自动判断要不要先启摆**。给按键和串口用的统一入口。
  *
- * 三种情况：
- *   · 角度已在 `CENTER ± START` 内 → 等价于 `control_start()`，直接进双环 PID
- *   · 否则                        → 进入 `CONTROL_STATE_SWING_UP`，先荡摆杆
- *   · 已经在 RUN                  → 什么都不做（幂等）
+ * 两种情况：
+ *   · 已经在 RUN → 什么都不做（幂等），不要把正在稳住的摆杆打断
+ *   · 否则       → 进入 `CONTROL_STATE_SWING_UP`，**无条件启摆**
  *
- * @return error_t ERR_OK 已启动（含"开始启摆"）；ERR_NOT_INITIALIZED
+ * @return error_t ERR_OK 已开始启摆；ERR_NOT_INITIALIZED
  *
- * @note **与 `control_start()` 的唯一区别**：角度不在窗口内时，
- *       `control_start()` 返回 `ERR_NOT_READY` **拒绝**，本函数改为**去启摆**。
- *       保留前者那套严格语义，是为了让「角度不对就该拒」这条判断仍然能被
- *       单独测到（串口 `RUN` 命令走的仍是它）。
+ * @note **它不检查角度，也不做任何"是不是已经立好了"的猜测**，永远启摆。
+ *       2026-10-10 真机实测否掉了原先那条"在窗口内就直接进 PID"的捷径：
+ *       摆杆还在摆动时，静息读数会路过 `START` 窗口（实测读到过 1949），
+ *       于是 SWING 把"正在摆动的摆杆"当成"已经立好"，直接交给双环 →
+ *       电机猛冲 → 摆杆被甩飞。根因是 **某一瞬间落在窗口内，既不等于
+ *       "摆杆是立着的"，也不等于"它是静止的"**。
+ *
+ *       **要"手扶好再启动"请用 `control_start()`**（串口 `RUN`）——
+ *       那条路径的准入检查没变。
  *
  * @note 启摆期间 `control_is_running()` 返回 **false** —— 它问的是
  *       「双环在不在跑」。要看总状态请读 `control_get_status()` 的 `state`。

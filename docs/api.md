@@ -550,7 +550,7 @@ TB6612FNG 的 A 路，驱动 25GA370 直流电机。**20 kHz PWM**（TIM2_CH1，
 **语义要点**
 
 - **duty 的量纲是「写进 CCR 的原始值」**：因为 ARR=1799，占空比 = `CCR/(ARR+1)` = `CCR/1800`，所以 `duty` 直接当 CCR 写、无需换算，**1800 对应 100% 而不是 100**。这个前提绑在 `BSP_MOTOR_PWM_ARR` 上。
-- ⚠️ **参考工程的 PID 增益不能照抄**：参考工程的 PWM 量程是 100（ARR=99），本工程是 1800，**差 18 倍**。`control.c` 的默认增益已经乘过 18（见 [motor.md](motor.md#23-为什么-pwm-频率选-20-khz)）。
+- ⚠️ **参考工程的增益不能整组照抄**：参考的 PWM 量程是 100（ARR=99），本工程是 1800，差 18 倍。但**只有输出直接喂 PWM 的那些**才按 ×18 换算（角度环、`OFFSET`、启摆的 `SWP`）；位置环的输出喂的是内环的角度目标、单位是 ADC 码，**原值照抄**。详见 [control.c](../app/control/control.c) 里"默认增益"那段注释。
 - **越界是夹紧，不返回错误**：调用者主要是 PID 控制环，其输出瞬态越界属正常现象；此时让电机**停摆**比夹紧到边界危险得多（倒立摆失去力矩会直接倒）。需要严格边界检查的场合请调用前自行判断。
 - **`coast()` 与 `set_duty(0)` 等价**（都是 AIN1=AIN2=0 + CCR=0），但**与 `brake()` 电气状态完全不同**——前者电机可自由转动，后者有明显阻力。调试时用手扭输出轴就能区分（见 [motor.md](motor.md#54-第三层方向一致性最要紧的一条)）。
 - **`init()` 里的顺序不能调换**：先写方向/CCR，最后 `HAL_TIM_PWM_Start()`，保证上电绝不带非零占空比。
@@ -721,7 +721,7 @@ TIM3 编码器模式，AB 正交**四倍频**。**408 边沿 / 输出轴圈**。
 | 初始化 | `error_t control_init(void)` | 载默认参数、对齐快照、把电机置滑行。**初始状态是 STOP**；要在电机/编码器/角度三个驱动之后调 |
 | 1 ms 任务 | `void control_tick(void)` | **挂在节拍上，中断上下文**。取角度、推进编码器、倒下保护、分频出 5 ms / 50 ms 两环 |
 | 启动 | `error_t control_start(void)` | **严格**：角度不在 `CENTER ± START` 内返回 `ERR_NOT_READY`；会清两个环的积分与历史误差 |
-| 启动（自动）| `error_t control_swing_up(void)` | 角度已在窗口内 → 等价于 `control_start()`；否则 → 进 `CONTROL_STATE_SWING_UP` 自动启摆。已在 RUN 时幂等返回 |
+| 启动（自动）| `error_t control_swing_up(void)` | **无条件启摆**：进入 `CONTROL_STATE_SWING_UP`，荡进窗口后自动转 RUN。已在 RUN 时幂等返回。**不检查角度、不猜姿态** |
 | 停止 | `error_t control_stop(void)` | 电机**滑行**（不是刹车）；倒下保护内部也走它 |
 | 是否运行 | `bool control_is_running(void)` | 唯一的「运行状态」真相，别在别处再存一份 |
 | 位置清零 | `error_t control_zero_position(void)` | 位置与位置目标**一起**清零（分两步做容易只做一半） |
@@ -780,7 +780,7 @@ GET <名> | GET ALL     → OK ...
 STAT                   → OK ANGLE=.. POS=.. SPD=.. ATAR=.. AOUT=.. POUT=..
                             PWM=.. RUN=.. ST=.. SWR=..
 RUN                    → OK RUN=1        角度不在 START 窗口内则 ERR NOT_READY
-SWING                  → OK ST=1|2       在窗口内等价于 RUN，否则先自动启摆
+SWING                  → OK ST=2         无条件启摆，荡进窗口后自动转 RUN
 STOP                   → OK RUN=0
 ZERO                   → OK POS=0 TARGET=0
 TARGET <整数>           → OK TARGET=<n>
@@ -790,13 +790,18 @@ HELP                   → OK CMD=.. PARAM=..
 
 `RUN` 与 `SWING` 的分工：
 
-| | 角度已在 `CENTER ± START` 内 | 不在窗口内 |
-| --- | --- | --- |
-| `RUN` | 进双环 PID，`OK RUN=1` | **拒绝**，`ERR NOT_READY ANGLE_OUT_OF_WINDOW` |
-| `SWING` | 同 `RUN`，`OK ST=1` | **自动启摆**，`OK ST=2`，荡进窗口后自动转成双环 |
+| | 行为 |
+| --- | --- |
+| `RUN` | **严格**：角度不在 `CENTER ± START`（±150）内就回 `ERR NOT_READY`。语义是"我确认摆杆已经立好了，直接闭环"。 |
+| `SWING` | **无条件启摆**：不检查角度、不猜姿态，一律先把摆杆荡起来，进窗口后自动转 RUN。正常恒回 `OK ST=2`。 |
 
 保留两套而不是让 `RUN` 自动回退，是为了让「角度不对就该拒」这条已验证的判断
 仍能被单独测到，也让"会真的甩电机"必须被调用者**显式**要求。
+
+> ⚠️ `SWING` 原先有一条"角度已在窗口内就直接进 PID"的捷径，2026-10-10 实测否掉了：
+> 摆杆还在摆动时读数会路过窗口（实测读到过 1949），据此走捷径会把**正在摆动的摆杆**
+> 当成"已经立好"直接进 PID，电机猛冲、摆杆被甩飞。**某一瞬间落在窗口内，
+> 既不等于摆杆是立着的，也不等于它是静止的。**
 
 `STAT` 末尾两个状态字段：`ST`（0 停 / 1 双环 / 2 启摆中）与
 `SWR`（上次启摆结局：0 没启摆过 / 1 成功 / 2 超时 / 3 被 STOP 打断）。
